@@ -1117,7 +1117,7 @@ class DatabaseOptimizationReport:
                 if rows_result and rows_result[0]:
                     estimated_rows = rows_result[0]
                     if estimated_rows is not None and estimated_rows > 0:
-                        print(f"ℹ️ 使用information_schema估算表 {table_name} 行数: {estimated_rows:,} (估算值)")
+                        print(f"ℹ️ 使用information_schema估算表 {table_name} 行数: {{:,}} (估算值)".format(estimated_rows))
                         conn.close()
                         return estimated_rows
                 
@@ -1128,7 +1128,7 @@ class DatabaseOptimizationReport:
                 if table_status_result and len(table_status_result) > 4:
                     estimated_rows = table_status_result[4]  # Rows字段
                     if estimated_rows is not None and estimated_rows > 0:
-                        print(f"ℹ️ 使用SHOW TABLE STATUS估算表 {table_name} 行数: {estimated_rows:,} (估算值)")
+                        print(f"ℹ️ 使用SHOW TABLE STATUS估算表 {table_name} 行数: {{:,}} (估算值)".format(estimated_rows))
                         conn.close()
                         return estimated_rows
                 
@@ -1136,7 +1136,7 @@ class DatabaseOptimizationReport:
                 if data_length > 100 * 1024 * 1024:  # >100MB
                     # 根据经验，假设平均每行1KB，这只是一个粗略估算
                     rough_estimate = data_length // 1024
-                    print(f"⚠️ 表 {table_name} 数据量较大 ({data_length / 1024 / 1024:.1f}MB)，使用粗略估算: {rough_estimate:,}行")
+                    print(f"⚠️ 表 {table_name} 数据量较大 ({{:.1f}}MB)，使用粗略估算: {{:,}}行".format(data_length / 1024 / 1024, rough_estimate))
                     conn.close()
                     return rough_estimate if rough_estimate > 0 else 10000  # 最小返回10000
                 
@@ -2218,7 +2218,12 @@ class DatabaseOptimizationReport:
         # 报告日期（减少空行）
         date_info = self.document.add_paragraph()
         date_info.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        date_run = date_info.add_run(f"生成日期: {datetime.now().strftime('%Y年%m月%d日 %H:%M:%S')}")
+        # 避免中文编码问题，分别获取年月日然后手动组合
+        current_year = datetime.now().strftime('%Y')
+        current_month = datetime.now().strftime('%m')
+        current_day = datetime.now().strftime('%d')
+        current_time = datetime.now().strftime('%H:%M:%S')
+        date_run = date_info.add_run(f"生成日期: {current_year}年{current_month}月{current_day}日 {current_time}")
         date_run.font.name = '宋体'
         date_run.font.size = Pt(11)
         date_run.font.color.rgb = RGBColor(64, 64, 64)
@@ -2935,7 +2940,7 @@ class DatabaseOptimizationReport:
                         optimization_parts.append("4. 检查是否存在索引失效场景（如函数使用、类型转换、前导模糊查询等）")
                     elif table_row_count > 4000000:
                         # 表行数超过400万，建议历史数据清理
-                        optimization_parts.append(f"🎯 智能诊断: 字段 {field_name} 已有索引，{table_name}表行数为{table_row_count:,}，超过400万，建议进行历史数据清理")
+                        optimization_parts.append(f"🎯 智能诊断: 字段 {field_name} 已有索引，{table_name}表行数为{{:,}}，超过400万，建议进行历史数据清理".format(table_row_count))
                         optimization_parts.append("")
                         optimization_parts.append("💡 深度优化建议:")
                         optimization_parts.append("1. 考虑按时间分区归档历史数据")
@@ -2943,7 +2948,7 @@ class DatabaseOptimizationReport:
                         optimization_parts.append("3. 考虑使用分区表优化大表性能")
                     else:
                         # 表行数正常，提供多维度优化建议
-                        optimization_parts.append(f"🎯 智能诊断: 字段 {field_name} 已有索引，{table_name}表行数为{table_row_count:,}，在正常范围内")
+                        optimization_parts.append(f"🎯 智能诊断: 字段 {field_name} 已有索引，{table_name}表行数为{{:,}}，在正常范围内".format(table_row_count))
                         optimization_parts.append("")
                         optimization_parts.append("💡 深度优化建议:")
                         
@@ -2958,7 +2963,7 @@ class DatabaseOptimizationReport:
                         
                         # 数据分布检查建议
                         if table_row_count and table_row_count > 100000:
-                            row_count_str = f"{table_row_count:,}"
+                            row_count_str = "{:,}".format(table_row_count)
                             optimization_parts.append(f"4. 表数据量较大({row_count_str}行)，关注索引选择性，确保字段值分布均匀")
                         
                         # 索引维护建议
@@ -4731,9 +4736,11 @@ class DatabaseOptimizationReport:
                             # 添加执行次数总和统计
                             if hasattr(self, 'compare_data') and self.compare_data:
                                 total_executions = self.compare_data.get('last_month', {}).get('total_execute_cnt', 0)
-                                if total_executions > 0:
-                                    findings.append(f"性能问题SQL概览表格中执行次数总和：{total_executions:,}次")
-                            
+                            if total_executions > 0:
+                                # Python 3.6兼容的千位分隔符格式化
+                                formatted_executions = "{:,}".format(total_executions)
+                                findings.append(f"性能问题SQL概览表格中执行次数总和：{formatted_executions}次")
+                                            
                             # 添加慢查询减少效果
                             if slow_queries_reduced > 0 and slow_queries_reduction_rate > 0:
                                 findings.append(f"预计慢查询数量减少{slow_queries_reduced}个，降低{slow_queries_reduction_rate:.0f}%")

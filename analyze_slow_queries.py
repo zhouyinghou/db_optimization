@@ -8,7 +8,7 @@
 import pymysql
 import json
 import requests
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 from mysql_slow_query_optimizer import MySQLSlowQueryOptimizer
 import re
 import os
@@ -39,7 +39,7 @@ class DateTimeEncoder(json.JSONEncoder):
         return super().default(obj)
 
 # 智能数据库名识别函数
-def extract_db_table_from_sql(sql_content: str) -> tuple[Optional[str], Optional[str]]:
+def extract_db_table_from_sql(sql_content: str) -> Tuple[Optional[str], Optional[str]]:
     """从SQL语句中提取数据库名和表名"""
     if not sql_content:
         return None, None
@@ -1039,12 +1039,17 @@ EXPLAIN执行计划:
             last_day_of_previous_month = first_day_of_current_month - timedelta(days=1)
             first_day_of_previous_month = last_day_of_previous_month.replace(day=1)
             
-            last_month_name = last_day_of_previous_month.strftime('%Y年%m月')
+            # 使用数字格式避免中文编码问题，然后手动添加中文
+            last_month_year = last_day_of_previous_month.strftime('%Y')
+            last_month_month = last_day_of_previous_month.strftime('%m')
+            last_month_name = f"{last_month_year}年{last_month_month}月"
             
             # 计算上上个月
             first_day_of_last_month = first_day_of_previous_month
             last_day_of_two_months_ago = first_day_of_last_month - timedelta(days=1)
-            previous_month_name = last_day_of_two_months_ago.strftime('%Y年%m月')
+            previous_month_year = last_day_of_two_months_ago.strftime('%Y')
+            previous_month_month = last_day_of_two_months_ago.strftime('%m')
+            previous_month_name = f"{previous_month_year}年{previous_month_month}月"
             
             return {
                 'last_month': {
