@@ -18,6 +18,7 @@ from docx.oxml.ns import nsdecls
 
 # 添加必要的导入
 from analyze_slow_queries import SlowQueryAnalyzer
+import mysql.connector
 
 class DatabaseOptimizationReport:
     """数据库智能优化分析报告生成器"""

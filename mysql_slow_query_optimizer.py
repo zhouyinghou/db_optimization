@@ -10,7 +10,7 @@ MySQL慢查询优化工具
 """
 
 import json
-import pymysql
+import mysql.connector
 from typing import Dict, List, Optional
 import os
 
@@ -48,7 +48,7 @@ class MySQLSlowQueryOptimizer:
         except FileNotFoundError:
             return []
     
-    def _get_db_connection(self, database: str) -> Optional[pymysql.Connection]:
+    def _get_db_connection(self, database: str) -> Optional[mysql.connector.connection.MySQLConnection]:
         """
         根据数据库名获取连接
         
@@ -61,15 +61,15 @@ class MySQLSlowQueryOptimizer:
         for config in self.db_configs:
             if config.get('database') == database:
                 try:
-                    conn = pymysql.connect(
+                    conn = mysql.connector.connect(
                         host=config['host'],
                         port=config.get('port', 3306),
                         user=config['user'],
                         password=config['password'],
                         database=database,
                         charset='utf8mb4',
-                        connect_timeout=5,
-                        read_timeout=10
+                        collation='utf8mb4_general_ci',
+                        connection_timeout=10
                     )
                     return conn
                 except Exception as e:

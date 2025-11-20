@@ -5,7 +5,8 @@
 3. 使用LangChain和DeepSeek AI进行智能优化建议
 """
 
-import pymysql
+import mysql.connector
+from mysql.connector import Error as MySQLError
 import json
 import requests
 from typing import List, Dict, Optional, Any, Tuple
@@ -301,15 +302,15 @@ class SlowQueryAnalyzer:
             logger.info(f"正在连接到慢查询数据库: {self.slow_query_db_host}:{self.slow_query_db_port}")
             
             # 使用上下文管理器连接数据库，确保资源正确释放
-            with pymysql.connect(
+            with mysql.connector.connect(
                 host=self.slow_query_db_host,
                 port=self.slow_query_db_port,
                 user=self.slow_query_db_user,
                 password=self.slow_query_db_password,
                 database=self.slow_query_db_name,  # 如果指定了数据库名则使用
                 charset='utf8mb4',
-                connect_timeout=5,
-                read_timeout=10
+                collation='utf8mb4_general_ci',
+                connect_timeout=5
             ) as connection:
                 logger.info(f"成功连接到数据库")
                 logger.debug(f"连接对象类型: {type(connection)}")
@@ -321,18 +322,18 @@ class SlowQueryAnalyzer:
                     logger.error(f"连接对象所有属性: {dir(connection)}")
                     raise AttributeError(f"连接对象类型 {type(connection)} 没有cursor方法")
                 
-                # 额外验证：确保这是PyMySQL连接对象
+                # 额外验证：确保这是mysql.connector连接对象
                 try:
-                    # 使用全局pymysql模块进行类型检查
-                    if not isinstance(connection, pymysql.connections.Connection):
-                        logger.error(f"连接对象不是PyMySQL Connection类型! 实际类型: {type(connection)}")
-                        raise TypeError(f"期望PyMySQL Connection，但得到 {type(connection)}")
+                    # 使用全局mysql.connector模块进行类型检查
+                    if not isinstance(connection, mysql.connector.connection.MySQLConnection):
+                        logger.error(f"连接对象不是MySQLConnection类型! 实际类型: {type(connection)}")
+                        raise TypeError(f"期望MySQLConnection，但得到 {type(connection)}")
                 except (ImportError, AttributeError):
-                    # 如果无法访问pymysql.connections，跳过类型检查
-                    logger.debug("无法访问pymysql.connections，跳过连接类型验证")
+                    # 如果无法访问mysql.connector，跳过类型检查
+                    logger.debug("无法访问mysql.connector，跳过连接类型验证")
                 
                 logger.debug(f"连接对象验证通过，准备创建游标")
-                with connection.cursor(pymysql.cursors.DictCursor) as cursor:
+                with connection.cursor(dictionary=True) as cursor:
                     # 构建查询SQL，如果指定了数据库名则使用 database.table 格式
                     # 验证表名安全性
                     logger.info(f"当前使用的慢查询表名: {self.slow_query_table}")
@@ -781,7 +782,9 @@ EXPLAIN执行计划:
                 'password': self.slow_query_db_password,
                 'database': db_name,
                 'charset': 'utf8mb4',
-                'cursorclass': pymysql.cursors.DictCursor
+                'collation': 'utf8mb4_general_ci',
+                'use_unicode': True,
+                'get_warnings': True
             }
             return config
         except Exception as e:
@@ -792,7 +795,7 @@ EXPLAIN执行计划:
         """获取表结构信息，包括索引信息"""
         try:
             # 创建新的数据库连接
-            connection = pymysql.connect(**db_config)
+            connection = mysql.connector.connect(**db_config)
             
             with connection.cursor() as cursor:
                 # 检查表是否存在
@@ -870,13 +873,12 @@ EXPLAIN执行计划:
     
     def _get_explain_result(self, db_config: Dict, sql_content: str) -> Dict[str, Any]:
         """获取EXPLAIN结果"""
-        # 确保使用全局导入的pymysql
-        global pymysql
+        # 确保使用全局mysql.connector模块进行类型检查
         connection = None
         
         try:
             # 创建新的数据库连接
-            connection = pymysql.connect(**db_config)
+            connection = mysql.connector.connect(**db_config)
             
             with connection.cursor() as cursor:
                 # 执行EXPLAIN
