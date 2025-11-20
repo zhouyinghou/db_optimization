@@ -79,7 +79,18 @@ def extract_db_table_from_sql(sql_content: str) -> Tuple[Optional[str], Optional
 
 def find_database_for_table(connection, table_name: str) -> Optional[str]:
     """在所有数据库中查找包含指定表的数据库"""
+    
+    # 调试：检查传入的connection参数
+    logger.debug(f"find_database_for_table - 接收到的connection类型: {type(connection)}")
+    if connection is not None:
+        logger.debug(f"find_database_for_table - connection有cursor属性: {hasattr(connection, 'cursor')}")
+    
     if not table_name or not connection:
+        return None
+    
+    # 验证connection对象
+    if not hasattr(connection, 'cursor'):
+        logger.error(f"find_database_for_table - connection对象无效! 类型: {type(connection)}, 缺少cursor方法")
         return None
         
     # 排除系统数据库
@@ -123,6 +134,12 @@ def find_database_for_table(connection, table_name: str) -> Optional[str]:
 def get_intelligent_db_name(sql_content: str, table_name: Optional[str] = None, 
                           connection=None, hostname: str = "") -> str:
     """智能识别数据库名"""
+    
+    # 调试：检查connection参数
+    logger.debug(f"get_intelligent_db_name - connection类型: {type(connection)}")
+    logger.debug(f"get_intelligent_db_name - connection值: {connection}")
+    if connection is not None:
+        logger.debug(f"get_intelligent_db_name - connection属性: {dir(connection)[:5]}...")
     
     # 1. 从SQL语句中提取数据库名
     db_from_sql, table_from_sql = extract_db_table_from_sql(sql_content)
@@ -264,7 +281,26 @@ class SlowQueryAnalyzer:
                 read_timeout=10
             ) as connection:
                 logger.info(f"成功连接到数据库")
+                logger.debug(f"连接对象类型: {type(connection)}")
+                logger.debug(f"连接对象属性: {dir(connection)[:10]}...")  # 显示前10个属性
                 
+                # 验证连接对象是否有cursor方法
+                if not hasattr(connection, 'cursor'):
+                    logger.error(f"连接对象缺少cursor方法! 类型: {type(connection)}")
+                    logger.error(f"连接对象所有属性: {dir(connection)}")
+                    raise AttributeError(f"连接对象类型 {type(connection)} 没有cursor方法")
+                
+                # 额外验证：确保这是PyMySQL连接对象
+                try:
+                    # 使用全局pymysql模块进行类型检查
+                    if not isinstance(connection, pymysql.connections.Connection):
+                        logger.error(f"连接对象不是PyMySQL Connection类型! 实际类型: {type(connection)}")
+                        raise TypeError(f"期望PyMySQL Connection，但得到 {type(connection)}")
+                except (ImportError, AttributeError):
+                    # 如果无法访问pymysql.connections，跳过类型检查
+                    logger.debug("无法访问pymysql.connections，跳过连接类型验证")
+                
+                logger.debug(f"连接对象验证通过，准备创建游标")
                 with connection.cursor(pymysql.cursors.DictCursor) as cursor:
                     # 构建查询SQL，如果指定了数据库名则使用 database.table 格式
                     # 验证表名安全性
@@ -329,7 +365,12 @@ class SlowQueryAnalyzer:
                             if hasattr(cursor, '_last_executed'):
                                 print(cursor._last_executed.decode('utf-8') if isinstance(cursor._last_executed, bytes) else str(cursor._last_executed))
                             else:
-                                print(template.replace('%s', '{}').format(*params))
+                                # 使用更安全的方式显示参数，避免格式字符串冲突
+                                display_sql = template
+                                for param in params:
+                                    # 将每个%s替换为参数的字符串表示，避免格式冲突
+                                    display_sql = display_sql.replace('%s', repr(param), 1)
+                                print(display_sql)
                             print("-----------------------------------------")
                             
                             # 获取查询结果
@@ -338,19 +379,26 @@ class SlowQueryAnalyzer:
                             query_success = True
                             break
                             
-                        except pymysql.MySQLError as e:
-                            error_code = e.args[0] if e.args else 0
+                        except Exception as e:
+                            # 处理数据库相关错误
+                            error_code = getattr(e, 'args', [0])[0] if hasattr(e, 'args') else 0
                             error_msg = str(e)
-                            logger.warning(f"查询模板 {i} 失败 (错误码: {error_code}): {error_msg}")
                             
-                            if error_code == 1054:  # Unknown column
-                                logger.info("检测到未知列错误，尝试下一个查询模板")
-                                continue
-                            elif error_code == 1146:  # Table doesn't exist
-                                logger.warning(f"表不存在: {table_ref}")
-                                return slow_queries
+                            # 检查是否是MySQL错误
+                            if 'MySQL' in str(type(e)) or error_code in [1054, 1146]:
+                                logger.warning(f"查询模板 {i} 失败 (错误码: {error_code}): {error_msg}")
+                                
+                                if error_code == 1054:  # Unknown column
+                                    logger.info("检测到未知列错误，尝试下一个查询模板")
+                                    continue
+                                elif error_code == 1146:  # Table doesn't exist
+                                    logger.warning(f"表不存在: {table_ref}")
+                                    return slow_queries
+                                else:
+                                    logger.error(f"查询失败: {error_msg}")
+                                    raise
                             else:
-                                logger.error(f"查询失败: {error_msg}")
+                                # 非MySQL错误，重新抛出
                                 raise
                     
                     if not query_success:
@@ -360,8 +408,14 @@ class SlowQueryAnalyzer:
                     logger.info(f"从慢查询表获取到 {len(results)} 条慢查询记录")
                     
                     # 处理查询结果
-                    for row in results:
+                    for i, row in enumerate(results):
                         try:
+                            # 调试：跟踪connection变量状态
+                            logger.debug(f"处理第{i}行数据 - connection类型: {type(connection)}")
+                            if connection is not None and not hasattr(connection, 'cursor'):
+                                logger.error(f"处理第{i}行时connection对象异常! 类型: {type(connection)}, 属性: {dir(connection)[:5]}")
+                                raise AttributeError(f"connection对象在第{i}行处理时变为 {type(connection)} 类型，缺少cursor方法")
+                            
                             sql_content = row.get('sql_content', '') or row.get('sample', '')
                             if not sql_content:
                                 logger.warning("SQL内容为空，跳过处理")
@@ -379,8 +433,14 @@ class SlowQueryAnalyzer:
                             # 获取原始数据库名
                             original_db_name = row.get('db_name', '') or row.get('database', '')
                             
+                            # 调试：检查调用前的connection变量
+                            logger.debug(f"调用get_intelligent_db_name前 - connection类型: {type(connection)}")
+                            logger.debug(f"调用get_intelligent_db_name前 - connection值: {connection}")
+                            if connection is not None:
+                                logger.debug(f"调用get_intelligent_db_name前 - 有cursor属性: {hasattr(connection, 'cursor')}")
+                            
                             # 使用智能数据库名识别 - 使用get_intelligent_db_name函数
-                            intelligent_db_name = get_intelligent_db_name(sql_content)
+                            intelligent_db_name = get_intelligent_db_name(sql_content, table_name, connection, hostname_max)
                             
                             # 如果智能识别成功且与原始数据库名不同，使用智能识别的结果
                             if intelligent_db_name and intelligent_db_name != original_db_name:
@@ -410,14 +470,23 @@ class SlowQueryAnalyzer:
                     logger.info(f"成功处理 {len(slow_queries)} 条慢查询记录")
                     return slow_queries
                     
-        except pymysql.MySQLError as e:
-            error_code = e.args[0] if e.args else 0
+        except Exception as e:
+            # 处理数据库相关错误
+            error_code = getattr(e, 'args', [0])[0] if hasattr(e, 'args') else 0
             error_msg = str(e)
-            logger.error(f"数据库错误 (错误码: {error_code}): {error_msg}", exc_info=True)
-            print(f"✗ 数据库连接或查询失败: {error_msg}")
             
-            if error_code == 1046:  # No database selected
-                print(f"⚠ 错误：未选择数据库，请在创建分析器时设置 slow_query_db_name 参数")
+            # 检查是否是MySQL错误
+            if 'MySQL' in str(type(e)) or error_code in [1046]:
+                logger.error(f"数据库错误 (错误码: {error_code}): {error_msg}", exc_info=True)
+                print(f"✗ 数据库连接或查询失败: {error_msg}")
+                
+                if error_code == 1046:  # No database selected
+                    print(f"⚠ 错误：未选择数据库，请在创建分析器时设置 slow_query_db_name 参数")
+            else:
+                # 非MySQL错误，记录后重新抛出
+                logger.error(f"获取慢查询SQL失败: {str(e)}", exc_info=True)
+                print(f"✗ 获取慢查询SQL失败: {e}")
+                raise
         except ValueError as e:
             logger.error(f"参数验证错误: {str(e)}")
             print(f"✗ 参数验证失败: {str(e)}")
@@ -704,22 +773,35 @@ EXPLAIN执行计划:
                     'table': table_name
                 }
                 
-        except pymysql.MySQLError as e:
-            error_code = e.args[0] if e.args else 0
-            logger.error(f"获取表结构失败 (错误码: {error_code}): {str(e)}")
+        except Exception as e:
+            # 处理数据库相关错误
+            error_code = getattr(e, 'args', [0])[0] if hasattr(e, 'args') else 0
+            error_msg = str(e)
             
-            if error_code == 1146:  # Table doesn't exist
-                return {'error': 'table_not_found'}
-            elif error_code == 1049:  # Unknown database
-                return {'error': 'database_not_found'}
+            # 检查是否是MySQL错误
+            if 'MySQL' in str(type(e)) or error_code in [1146, 1049]:
+                logger.error(f"获取表结构失败 (错误码: {error_code}): {error_msg}")
+                
+                if error_code == 1146:  # Table doesn't exist
+                    return {'error': 'table_not_found'}
+                elif error_code == 1049:  # Unknown database
+                    return {'error': 'database_not_found'}
+                else:
+                    return {'error': error_msg}
             else:
-                return {'error': str(e)}
+                # 非MySQL错误，记录后返回
+                logger.error(f"获取表结构时出错: {error_msg}")
+                return {'error': error_msg}
         except Exception as e:
             logger.error(f"获取表结构时出错: {e}")
             return {'error': str(e)}
     
     def _get_explain_result(self, db_config: Dict, sql_content: str) -> Dict[str, Any]:
         """获取EXPLAIN结果"""
+        # 确保使用全局导入的pymysql
+        global pymysql
+        connection = None
+        
         try:
             # 创建新的数据库连接
             connection = pymysql.connect(**db_config)
@@ -728,8 +810,6 @@ EXPLAIN执行计划:
                 # 执行EXPLAIN
                 cursor.execute(f"EXPLAIN {sql_content}")
                 explain_rows = cursor.fetchall()
-                
-                connection.close()
                 
                 # 分析EXPLAIN结果
                 analysis = {
@@ -768,13 +848,26 @@ EXPLAIN执行计划:
                 
                 return analysis
                 
-        except pymysql.MySQLError as e:
-            error_code = e.args[0] if e.args else 0
-            logger.error(f"EXPLAIN执行失败 (错误码: {error_code}): {str(e)}")
-            return {'error': str(e)}
         except Exception as e:
-            logger.error(f"获取EXPLAIN结果时出错: {e}")
-            return {'error': str(e)}
+            # 处理数据库相关错误
+            error_code = getattr(e, 'args', [0])[0] if hasattr(e, 'args') else 0
+            error_msg = str(e)
+            
+            # 检查是否是MySQL错误
+            if 'MySQL' in str(type(e)):
+                logger.error(f"EXPLAIN执行失败 (错误码: {error_code}): {error_msg}")
+                return {'error': error_msg}
+            else:
+                # 非MySQL错误，记录后返回
+                logger.error(f"获取EXPLAIN结果时出错: {error_msg}")
+                return {'error': error_msg}
+        finally:
+            # 确保连接关闭
+            if connection and hasattr(connection, 'close'):
+                try:
+                    connection.close()
+                except Exception:
+                    pass
     
     def _get_deepseek_optimization_suggestions(self, sql_content: str, table_structure: Dict, explain_result: Dict) -> List[str]:
         """获取DeepSeek API的优化建议"""
