@@ -80,6 +80,10 @@ def extract_db_table_from_sql(sql_content: str) -> Tuple[Optional[str], Optional
 def find_database_for_table(connection, table_name: str) -> Optional[str]:
     """在所有数据库中查找包含指定表的数据库"""
     
+    # 保存原始连接引用，防止被修改
+    original_connection = connection
+    original_connection_id = id(connection)
+    
     # 调试：检查传入的connection参数
     logger.debug(f"find_database_for_table - 接收到的connection类型: {type(connection)}")
     if connection is not None:
@@ -100,10 +104,21 @@ def find_database_for_table(connection, table_name: str) -> Optional[str]:
     }
     
     try:
-        with connection.cursor() as cursor:
+        # 保存原始连接对象类型用于验证
+        original_connection_type = type(connection)
+        
+        # 使用不同的变量名避免与参数名冲突
+        with connection.cursor() as search_cursor:
+            # 验证连接对象在cursor创建后没有被修改
+            if type(connection) != original_connection_type or id(connection) != original_connection_id:
+                logger.error(f"连接对象在cursor创建后被意外修改!")
+                logger.error(f"原始类型: {original_connection_type}, 当前类型: {type(connection)}")
+                logger.error(f"原始ID: {original_connection_id}, 当前ID: {id(connection)}")
+                return None
+                
             # 获取所有数据库
-            cursor.execute("SHOW DATABASES")
-            databases = [row['Database'] for row in cursor.fetchall()]
+            search_cursor.execute("SHOW DATABASES")
+            databases = [row['Database'] for row in search_cursor.fetchall()]
             
             # 过滤掉系统数据库
             candidate_databases = [db for db in databases if db not in excluded_databases]
@@ -112,12 +127,17 @@ def find_database_for_table(connection, table_name: str) -> Optional[str]:
             # 在每个候选数据库中查找表
             for db in candidate_databases:
                 try:
-                    cursor.execute(f"USE `{db}`")
-                    cursor.execute(f"SHOW TABLES LIKE '{table_name}'")
-                    result = cursor.fetchone()
+                    search_cursor.execute(f"USE `{db}`")
+                    search_cursor.execute(f"SHOW TABLES LIKE '{table_name}'")
+                    result = search_cursor.fetchone()
                     
                     if result:
-
+                        # 验证连接对象在操作过程中没有被修改
+                        if type(connection) != original_connection_type or id(connection) != original_connection_id:
+                            logger.error(f"连接对象在数据库操作中被意外修改!")
+                            logger.error(f"原始类型: {original_connection_type}, 当前类型: {type(connection)}")
+                            logger.error(f"原始ID: {original_connection_id}, 当前ID: {id(connection)}")
+                            return None
                         return db
                         
                 except Exception as e:
@@ -134,6 +154,9 @@ def find_database_for_table(connection, table_name: str) -> Optional[str]:
 def get_intelligent_db_name(sql_content: str, table_name: Optional[str] = None, 
                           connection=None, hostname: str = "") -> str:
     """智能识别数据库名"""
+    
+    # 保存原始连接引用，防止被修改
+    original_connection = connection
     
     # 调试：检查connection参数
     logger.debug(f"get_intelligent_db_name - connection类型: {type(connection)}")
@@ -154,6 +177,14 @@ def get_intelligent_db_name(sql_content: str, table_name: Optional[str] = None,
     if table_to_find and connection:
         logger.debug(f"从SQL提取到表名: {table_to_find}，正在查找数据库...")
         db_found = find_database_for_table(connection, table_to_find)
+        
+        # 验证连接对象没有被修改
+        if connection is not original_connection:
+            logger.error(f"连接对象在find_database_for_table调用中被意外修改!")
+            logger.error(f"原始连接: {type(original_connection)}, 当前连接: {type(connection)}")
+            # 恢复原始连接
+            connection = original_connection
+            
         if db_found:
             logger.debug(f"找到数据库: {db_found}")
             return db_found
@@ -414,6 +445,9 @@ class SlowQueryAnalyzer:
                             logger.debug(f"处理第{i}行数据 - connection类型: {type(connection)}")
                             if connection is not None and not hasattr(connection, 'cursor'):
                                 logger.error(f"处理第{i}行时connection对象异常! 类型: {type(connection)}, 属性: {dir(connection)[:5]}")
+                                # 记录更详细的调试信息
+                                logger.error(f"connection对象详细信息: {connection}")
+                                logger.error(f"connection对象所有属性: {[attr for attr in dir(connection) if not attr.startswith('_')]}")
                                 raise AttributeError(f"connection对象在第{i}行处理时变为 {type(connection)} 类型，缺少cursor方法")
                             
                             sql_content = row.get('sql_content', '') or row.get('sample', '')
@@ -440,7 +474,45 @@ class SlowQueryAnalyzer:
                                 logger.debug(f"调用get_intelligent_db_name前 - 有cursor属性: {hasattr(connection, 'cursor')}")
                             
                             # 使用智能数据库名识别 - 使用get_intelligent_db_name函数
-                            intelligent_db_name = get_intelligent_db_name(sql_content, table_name, connection, hostname_max)
+                            # 创建连接对象的防御性副本，防止变量被修改
+                            try:
+                                # 验证连接对象在调用前仍然是有效的Connection类型
+                                if connection is not None and hasattr(connection, 'cursor'):
+                                    # 保存原始连接的引用和ID，用于验证
+                                    original_connection_ref = connection
+                                    original_connection_id = id(connection)
+                                    original_connection_type = type(connection)
+                                    
+                                    logger.debug(f"调用get_intelligent_db_name前 - 连接ID: {original_connection_id}, 类型: {original_connection_type}")
+                                    
+                                    # 调用函数，使用原始连接引用
+                                    intelligent_db_name = get_intelligent_db_name(sql_content, table_name, connection, hostname_max)
+                                    
+                                    # 验证调用后connection变量没有被修改
+                                    current_connection_id = id(connection)
+                                    current_connection_type = type(connection)
+                                    
+                                    logger.debug(f"调用get_intelligent_db_name后 - 连接ID: {current_connection_id}, 类型: {current_connection_type}")
+                                    
+                                    if (current_connection_id != original_connection_id or 
+                                        current_connection_type != original_connection_type):
+                                        logger.error(f"连接对象在get_intelligent_db_name调用后发生变化!")
+                                        logger.error(f"调用前 - ID: {original_connection_id}, 类型: {original_connection_type}")
+                                        logger.error(f"调用后 - ID: {current_connection_id}, 类型: {current_connection_type}")
+                                        
+                                        # 尝试恢复连接对象
+                                        if original_connection_ref is not None and hasattr(original_connection_ref, 'cursor'):
+                                            logger.info("尝试恢复原始连接对象...")
+                                            # 这里不能直接恢复，因为connection是局部变量
+                                            # 但我们可以记录错误并继续处理
+                                        
+                                        raise RuntimeError(f"连接对象在函数调用中被意外修改: {current_connection_type}")
+                                else:
+                                    logger.warning(f"连接对象无效，跳过智能数据库名识别。类型: {type(connection)}")
+                                    intelligent_db_name = None
+                            except Exception as lookup_error:
+                                logger.error(f"智能数据库名识别失败: {lookup_error}")
+                                intelligent_db_name = None
                             
                             # 如果智能识别成功且与原始数据库名不同，使用智能识别的结果
                             if intelligent_db_name and intelligent_db_name != original_db_name:
