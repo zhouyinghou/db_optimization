@@ -18,7 +18,6 @@ from docx.oxml.ns import nsdecls
 
 # 添加必要的导入
 from analyze_slow_queries import SlowQueryAnalyzer
-import mysql.connector
 
 class DatabaseOptimizationReport:
     """数据库智能优化分析报告生成器"""
@@ -26,21 +25,29 @@ class DatabaseOptimizationReport:
     def __init__(self, analysis_results_file: str = 'slow_query_analysis_results.json', 
                  use_live_analysis: bool = False, 
                  slow_query_db_config: Dict = None,  # type: ignore
+                 business_db_config: Dict = None,  # type: ignore
                  min_execute_cnt: int = 1000,
                  min_query_time: float = 10.0,
                  load_data: bool = True):
         self.slow_query_db_config = slow_query_db_config
+        self.business_db_config = business_db_config
         self.analysis_data = None
         self.compare_data = None
         self.use_live_analysis = use_live_analysis
         # 定义需要排除的表名列表
         self.excluded_tables = ['test_table_0']
         
-        # 初始化数据库连接配置
+        # 初始化慢查询数据库连接配置
         self.slow_query_db_host = slow_query_db_config.get('host', '127.0.0.1') if slow_query_db_config else '127.0.0.1'
         self.slow_query_db_user = slow_query_db_config.get('user', 'test') if slow_query_db_config else 'test'
         self.slow_query_db_password = slow_query_db_config.get('password', 'test') if slow_query_db_config else 'test'
         self.slow_query_db_port = slow_query_db_config.get('port', 3306) if slow_query_db_config else 3306
+        
+        # 初始化业务数据库连接配置（用于查询实际慢查询的数据库）
+        self.business_db_host = business_db_config.get('host', '127.0.0.1') if business_db_config else '127.0.0.1'
+        self.business_db_user = business_db_config.get('user', 'test') if business_db_config else 'test'
+        self.business_db_password = business_db_config.get('password', 'test') if business_db_config else 'test'
+        self.business_db_port = business_db_config.get('port', 3306) if business_db_config else 3306
         
         if not load_data:
             # 不加载外部数据，仅用于测试
@@ -63,7 +70,8 @@ class DatabaseOptimizationReport:
                 slow_query_db_password=db_config.get('password', ''),
                 slow_query_db_port=db_config.get('port', 3306),
                 slow_query_db_name=db_config.get('database', ''),
-                slow_query_table=db_config.get('table', 't.slow')
+                slow_query_table=db_config.get('table', 'slow'),
+                business_db_config=self.business_db_config
             )
             
             # 执行对比分析
@@ -785,12 +793,12 @@ class DatabaseOptimizationReport:
         import pymysql
         
         try:
-            # 连接到t数据库查询cluster表
+            # 连接到t数据库查询cluster表（使用业务数据库连接配置）
             conn = pymysql.connect(
-                host=getattr(self, 'slow_query_db_host', '127.0.0.1'),
-                port=getattr(self, 'slow_query_db_port', 3306),
-                user=getattr(self, 'slow_query_db_user', 'test'),
-                password=getattr(self, 'slow_query_db_password', 'test'),
+                host=self.business_db_host,
+                port=self.business_db_port,
+                user=self.business_db_user,
+                password=self.business_db_password,
                 database='t',
                 charset='utf8mb4',
                 connect_timeout=5
@@ -844,8 +852,8 @@ class DatabaseOptimizationReport:
         """
         import pymysql
         
-        # 🎯 优先使用备库避免主库性能风险
-        original_host = hostname if hostname and hostname != 'localhost' else getattr(self, 'slow_query_db_host', '127.0.0.1')
+        # 🎯 优先使用备库避免主库性能风险（使用业务数据库配置）
+        original_host = hostname if hostname and hostname != 'localhost' else self.business_db_host
         
         # 尝试获取备库IP
         standby_host = self._get_standby_hostname(original_host)
@@ -866,12 +874,12 @@ class DatabaseOptimizationReport:
         
         connection = None
         try:
-            # 首先创建一个连接来检查系统状态
+            # 首先创建一个连接来检查系统状态（使用业务数据库配置）
             check_conn = pymysql.connect(
                 host=host,
-                port=getattr(self, 'slow_query_db_port', 3306),
-                user=getattr(self, 'slow_query_db_user', 'test'),
-                password=getattr(self, 'slow_query_db_password', 'test'),
+                port=self.business_db_port,
+                user=self.business_db_user,
+                password=self.business_db_password,
                 charset='utf8mb4',
                 connect_timeout=5
             )
@@ -892,18 +900,18 @@ class DatabaseOptimizationReport:
                 
                 # 2. 检查当前用户权限，确保只有查询权限
                 cursor.execute("SELECT * FROM information_schema.user_privileges WHERE grantee LIKE %s AND privilege_type IN ('SELECT', 'SELECT, INSERT, UPDATE, DELETE')", 
-                             (f"'%{getattr(self, 'slow_query_db_user', 'test')}%'",))
+                             (f"'%{self.business_db_user}%'",))
                 privileges = cursor.fetchall()
                 
                 has_write_privilege = any('INSERT' in str(priv) or 'UPDATE' in str(priv) or 'DELETE' in str(priv) for priv in privileges)
                 if has_write_privilege:
-                    # 重新连接，设置会话参数
+                    # 重新连接，设置会话参数（使用业务数据库配置）
                     check_conn.close()
                     connection = pymysql.connect(
                         host=host,
-                        port=getattr(self, 'slow_query_db_port', 3306),
-                        user=getattr(self, 'slow_query_db_user', 'test'),
-                        password=getattr(self, 'slow_query_db_password', 'test'),
+                        port=self.business_db_port,
+                        user=self.business_db_user,
+                        password=self.business_db_password,
                         charset='utf8mb4',
                         connect_timeout=5,
                         init_command="SET SESSION sql_mode='STRICT_TRANS_TABLES,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION'"
@@ -911,9 +919,9 @@ class DatabaseOptimizationReport:
                 else:
                     connection = pymysql.connect(
                         host=host,
-                        port=getattr(self, 'slow_query_db_port', 3306),
-                        user=getattr(self, 'slow_query_db_user', 'test'),
-                        password=getattr(self, 'slow_query_db_password', 'test'),
+                        port=self.business_db_port,
+                        user=self.business_db_user,
+                        password=self.business_db_password,
                         charset='utf8mb4',
                         connect_timeout=5
                     )

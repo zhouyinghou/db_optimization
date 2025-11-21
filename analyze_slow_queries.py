@@ -5,8 +5,7 @@
 3. 使用LangChain和DeepSeek AI进行智能优化建议
 """
 
-import mysql.connector
-from mysql.connector import Error as MySQLError
+import pymysql
 import json
 import requests
 from typing import List, Dict, Optional, Any, Tuple
@@ -223,6 +222,7 @@ class SlowQueryAnalyzer:
                  slow_query_db_port: int = None,
                  slow_query_db_name: str = None,
                  slow_query_table: str = None,
+                 business_db_config: Dict = None,  # type: ignore
                  deepseek_api_key: str = None):
         """
         初始化慢查询分析器
@@ -234,6 +234,7 @@ class SlowQueryAnalyzer:
             slow_query_db_port: 慢查询表所在数据库端口
             slow_query_db_name: 慢查询表所在数据库名（如果表不在默认数据库）
             slow_query_table: 慢查询表名
+            business_db_config: 业务数据库连接配置字典
             deepseek_api_key: DeepSeek API密钥
         """
         # 从环境变量安全读取配置，移除硬编码默认值
@@ -243,6 +244,13 @@ class SlowQueryAnalyzer:
         self.slow_query_db_port = slow_query_db_port or int(os.environ.get('SLOW_QUERY_DB_PORT', '3306'))
         self.slow_query_db_name = slow_query_db_name or os.environ.get('SLOW_QUERY_DB_NAME')
         self.slow_query_table = slow_query_table or os.environ.get('SLOW_QUERY_TABLE', 'slow')
+        
+        # 初始化业务数据库配置
+        self.business_db_config = business_db_config or {}
+        self.business_db_host = self.business_db_config.get('host', self.slow_query_db_host)
+        self.business_db_user = self.business_db_config.get('user', self.slow_query_db_user)
+        self.business_db_password = self.business_db_config.get('password', self.slow_query_db_password)
+        self.business_db_port = self.business_db_config.get('port', self.slow_query_db_port)
         
         # 验证必需的数据库配置
         if not all([self.slow_query_db_host, self.slow_query_db_user, self.slow_query_db_password]):
@@ -302,15 +310,15 @@ class SlowQueryAnalyzer:
             logger.info(f"正在连接到慢查询数据库: {self.slow_query_db_host}:{self.slow_query_db_port}")
             
             # 使用上下文管理器连接数据库，确保资源正确释放
-            with mysql.connector.connect(
+            with pymysql.connect(
                 host=self.slow_query_db_host,
                 port=self.slow_query_db_port,
                 user=self.slow_query_db_user,
                 password=self.slow_query_db_password,
                 database=self.slow_query_db_name,  # 如果指定了数据库名则使用
                 charset='utf8mb4',
-                collation='utf8mb4_general_ci',
-                connect_timeout=5
+                connect_timeout=5,
+                read_timeout=10
             ) as connection:
                 logger.info(f"成功连接到数据库")
                 logger.debug(f"连接对象类型: {type(connection)}")
@@ -322,18 +330,18 @@ class SlowQueryAnalyzer:
                     logger.error(f"连接对象所有属性: {dir(connection)}")
                     raise AttributeError(f"连接对象类型 {type(connection)} 没有cursor方法")
                 
-                # 额外验证：确保这是mysql.connector连接对象
+                # 额外验证：确保这是PyMySQL连接对象
                 try:
-                    # 使用全局mysql.connector模块进行类型检查
-                    if not isinstance(connection, mysql.connector.connection.MySQLConnection):
-                        logger.error(f"连接对象不是MySQLConnection类型! 实际类型: {type(connection)}")
-                        raise TypeError(f"期望MySQLConnection，但得到 {type(connection)}")
+                    # 使用全局pymysql模块进行类型检查
+                    if not isinstance(connection, pymysql.connections.Connection):
+                        logger.error(f"连接对象不是PyMySQL Connection类型! 实际类型: {type(connection)}")
+                        raise TypeError(f"期望PyMySQL Connection，但得到 {type(connection)}")
                 except (ImportError, AttributeError):
-                    # 如果无法访问mysql.connector，跳过类型检查
-                    logger.debug("无法访问mysql.connector，跳过连接类型验证")
+                    # 如果无法访问pymysql.connections，跳过类型检查
+                    logger.debug("无法访问pymysql.connections，跳过连接类型验证")
                 
                 logger.debug(f"连接对象验证通过，准备创建游标")
-                with connection.cursor(dictionary=True) as cursor:
+                with connection.cursor(pymysql.cursors.DictCursor) as cursor:
                     # 构建查询SQL，如果指定了数据库名则使用 database.table 格式
                     # 验证表名安全性
                     logger.info(f"当前使用的慢查询表名: {self.slow_query_table}")
@@ -774,17 +782,15 @@ EXPLAIN执行计划:
     def _get_database_config(self, hostname: str, db_name: str) -> Dict[str, Any]:
         """获取数据库配置"""
         try:
-            # 使用当前连接的配置作为基础
+            # 使用业务数据库配置作为基础（用于查询实际慢查询的数据库）
             config = {
-                'host': hostname or self.slow_query_db_host,
-                'port': self.slow_query_db_port,
-                'user': self.slow_query_db_user,
-                'password': self.slow_query_db_password,
+                'host': hostname or self.business_db_host,
+                'port': self.business_db_port,
+                'user': self.business_db_user,
+                'password': self.business_db_password,
                 'database': db_name,
                 'charset': 'utf8mb4',
-                'collation': 'utf8mb4_general_ci',
-                'use_unicode': True,
-                'get_warnings': True
+                'cursorclass': pymysql.cursors.DictCursor
             }
             return config
         except Exception as e:
@@ -795,7 +801,7 @@ EXPLAIN执行计划:
         """获取表结构信息，包括索引信息"""
         try:
             # 创建新的数据库连接
-            connection = mysql.connector.connect(**db_config)
+            connection = pymysql.connect(**db_config)
             
             with connection.cursor() as cursor:
                 # 检查表是否存在
@@ -873,12 +879,13 @@ EXPLAIN执行计划:
     
     def _get_explain_result(self, db_config: Dict, sql_content: str) -> Dict[str, Any]:
         """获取EXPLAIN结果"""
-        # 确保使用全局mysql.connector模块进行类型检查
+        # 确保使用全局导入的pymysql
+        global pymysql
         connection = None
         
         try:
             # 创建新的数据库连接
-            connection = mysql.connector.connect(**db_config)
+            connection = pymysql.connect(**db_config)
             
             with connection.cursor() as cursor:
                 # 执行EXPLAIN
