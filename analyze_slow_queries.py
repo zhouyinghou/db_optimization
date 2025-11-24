@@ -10,6 +10,7 @@ import json
 import requests
 from typing import List, Dict, Optional, Any, Tuple
 from mysql_slow_query_optimizer import MySQLSlowQueryOptimizer
+from sql_analyzer import SQLAnalyzer
 import re
 import os
 import logging
@@ -37,6 +38,7 @@ class DateTimeEncoder(json.JSONEncoder):
         elif isinstance(obj, timedelta):
             return str(obj)
         return super().default(obj)
+
 
 # 智能数据库名识别函数
 def extract_db_table_from_sql(sql_content: str) -> Tuple[Optional[str], Optional[str]]:
@@ -588,38 +590,16 @@ class SlowQueryAnalyzer:
         Returns:
             表名，如果无法提取则返回None
         """
-        sql_clean = sql.strip()
-        sql_upper = sql_clean.upper()
+        if not sql:
+            return None
         
-        # 提取FROM后的表名（最常用）
-        from_patterns = [
-            r'FROM\s+`?([a-zA-Z0-9_]+)`?\s',  # FROM `table` 或 FROM table
-            r'FROM\s+([a-zA-Z0-9_]+)\s',      # FROM table
-            r'FROM\s+`?([a-zA-Z0-9_]+)`?$',   # FROM table结尾
-        ]
+        table_name = SQLAnalyzer.extract_table_name(sql)
+        if table_name:
+            return table_name
         
-        for pattern in from_patterns:
-            match = re.search(pattern, sql_upper, re.IGNORECASE)
-            if match:
-                table = match.group(1)
-                # 排除一些关键字
-                if table.upper() not in ['SELECT', 'WHERE', 'JOIN', 'INNER', 'LEFT', 'RIGHT', 'OUTER']:
-                    return table
-        
-        # UPDATE语句
-        update_match = re.search(r'UPDATE\s+`?([a-zA-Z0-9_]+)`?', sql_upper, re.IGNORECASE)
-        if update_match:
-            return update_match.group(1)
-        
-        # INSERT语句
-        insert_match = re.search(r'INSERT\s+INTO\s+`?([a-zA-Z0-9_]+)`?', sql_upper, re.IGNORECASE)
-        if insert_match:
-            return insert_match.group(1)
-        
-        # DELETE语句
-        delete_match = re.search(r'DELETE\s+FROM\s+`?([a-zA-Z0-9_]+)`?', sql_upper, re.IGNORECASE)
-        if delete_match:
-            return delete_match.group(1)
+        fallback = SQLAnalyzer.extract_table_name_from_sql(sql)
+        if fallback and fallback != '未知表':
+            return fallback
         
         return None
     
@@ -950,7 +930,28 @@ EXPLAIN执行计划:
                 except Exception:
                     pass
     
-    def _get_deepseek_optimization_suggestions(self, sql_content: str, table_structure: Dict, explain_result: Dict) -> List[str]:
+    def _get_deepseek_optimization_suggestions(self, *args, **kwargs) -> List[str]:
+        """
+        获取DeepSeek API的优化建议，支持两种调用方式：
+        1. _get_deepseek_optimization_suggestions(sql_content, table_structure, explain_result)
+        2. _get_deepseek_optimization_suggestions(optimization_data_dict)
+        
+        Returns:
+            优化建议列表
+        """
+        # 兼容两种调用方式
+        if len(args) == 1 and isinstance(args[0], dict):
+            # 从字典中提取参数
+            optimization_data = args[0]
+            sql_content = optimization_data.get('sql', '')
+            table_structure = optimization_data.get('table_structure', {})
+            explain_result = optimization_data.get('explain_result', {})
+        elif len(args) >= 3:
+            # 直接使用传入的三个参数
+            sql_content, table_structure, explain_result = args[:3]
+        else:
+            logger.error("参数格式错误，无法解析优化建议请求")
+            return ["❌ 参数格式错误，请检查调用方式"]
         """获取DeepSeek API的优化建议"""
         try:
             # 检查是否有错误
@@ -1011,33 +1012,84 @@ EXPLAIN执行计划:
             logger.error(f"生成DeepSeek优化建议失败: {e}")
             return [f"生成优化建议时出错: {str(e)}"]
     
-    def _analyze_slow_query(self, sql_data: Dict) -> Dict:
+    def get_hostname_and_table(self, analysis_result: Dict) -> Dict:
         """
-        分析单条慢查询SQL
+        获取分析结果中的hostname_max和table_name最终值
         
         Args:
-            sql_data: 包含SQL信息的字典
+            analysis_result: 分析结果字典
+            
+        Returns:
+            包含hostname_max和table_name的字典
+        """
+        hostname_max = analysis_result.get('hostname_max', '')
+        table_name = analysis_result.get('table_name', '')
+        
+        # 如果hostname_max为空，尝试从其他字段获取
+        if not hostname_max:
+            hostname_max = analysis_result.get('slow_query_info', {}).get('hostname_max', '') or \
+                         analysis_result.get('slow_query_info', {}).get('host', '') or \
+                         analysis_result.get('slow_query_info', {}).get('ip', '') or 'localhost'
+        
+        # 如果table_name为空，尝试从SQL内容中提取
+        if not table_name and 'sql' in analysis_result:
+            _, extracted_table = extract_db_table_from_sql(analysis_result['sql'])
+            if extracted_table:
+                table_name = extracted_table
+        
+        return {
+            'hostname_max': hostname_max,
+            'table_name': table_name
+        }
+        
+    def _analyze_slow_query(self, query_data: Dict) -> Dict:
+        """
+        分析单条慢查询SQL，支持多种参数格式
+        
+        Args:
+            query_data: 包含SQL信息的字典，可以是sql_data或slow_query_info格式
             
         Returns:
             分析结果字典
         """
         try:
-            sql_content = sql_data.get('sql_content', '')
-            table_name = sql_data.get('table_name', '')
-            db_name = sql_data.get('db_name', '')
-            
-            if not sql_content or not table_name:
-                logger.warning("SQL内容或表名为空，跳过分析")
+            # 统一提取SQL内容，兼容两种参数格式
+            sql_content = query_data.get('sql_content', '')
+            if not sql_content:
+                logger.warning("SQL内容为空，跳过分析")
                 return {}
+            
+            # 提取基本信息，兼容两种参数格式
+            ip = query_data.get('ip', '')
+            db_name = query_data.get('db_name', '')
+            table_name = query_data.get('table_name', '')
+            execute_cnt = query_data.get('execute_cnt', 0)
+            query_time = query_data.get('query_time', 0.0)
+            
+            # 提取数据库名和表名
+            extracted_db, extracted_table = extract_db_table_from_sql(sql_content)
+            final_db_name = extracted_db or db_name or 'db'
+            
+            # 如果表名为空，尝试提取或使用默认值
+            if not table_name:
+                table_name = extracted_table or self.extract_table_name(sql_content) or 'unknown_table'
             
             logger.info(f"开始分析慢查询: {sql_content[:50]}... (表: {table_name})")
             
-            # 提取数据库名
-            extracted_db, _ = extract_db_table_from_sql(sql_content)
-            final_db_name = extracted_db or db_name or 'db'
+            # 获取hostname_max值，优先使用query_data中的值，否则使用默认值
+            hostname_max = query_data.get('hostname_max', '') or query_data.get('host', '') or ip or 'localhost'
             
             # 获取数据库配置
-            db_config = self._get_database_config(sql_data.get('hostname_max', ''), final_db_name)
+            db_config = self._get_database_config(hostname_max, final_db_name)
+            if not db_config:
+                logger.warning(f"未找到数据库配置: {hostname_max}:{final_db_name}")
+                db_config = {
+                    'host': hostname_max,
+                    'port': 3306,
+                    'user': '',
+                    'password': '',
+                    'database': final_db_name
+                }
             
             # 获取表结构信息
             table_structure = self._get_table_structure(db_config, table_name)
@@ -1045,64 +1097,51 @@ EXPLAIN执行计划:
             # 获取EXPLAIN结果
             explain_result = self._get_explain_result(db_config, sql_content)
             
-            # 获取DeepSeek优化建议
+            # 获取DeepSeek优化建议（现在方法已支持两种调用方式）
             optimization_suggestions = self._get_deepseek_optimization_suggestions({
                 'sql': sql_content,
                 'table_structure': table_structure,
                 'explain_result': explain_result,
-                'execute_cnt': sql_data.get('execute_cnt', 0),
-                'query_time': sql_data.get('query_time', 0.0),
-                'ip': sql_data.get('ip', ''),
+                'execute_cnt': execute_cnt,
+                'query_time': query_time,
+                'ip': ip,
                 'db_name': final_db_name
             })
             
-            return {
+            # 构建统一的结果
+            result = {
                 'sql': sql_content,
                 'table_name': table_name,
+                'database': final_db_name,  # 添加database字段以保持兼容性
                 'db_name': final_db_name,
+                'hostname_max': hostname_max,
                 'table_structure': table_structure,
                 'explain_result': explain_result,
                 'optimization_suggestions': optimization_suggestions,
                 'analysis_status': 'success'
             }
             
+            # 检查是否需要输出增强版报告
+            if hasattr(self, '_print_enhanced_report'):
+                self._print_enhanced_report(result)
+            
+            return result
+            
         except Exception as e:
             logger.error(f"分析慢查询失败: {str(e)}", exc_info=True)
+            
+            # 获取hostname_max值作为默认值
+            hostname_max = query_data.get('hostname_max', '') or query_data.get('host', '') or query_data.get('ip', '') or 'localhost'
+            
             return {
-                'sql': sql_content,
-                'table_name': table_name,
-                'db_name': db_name,
+                'sql': query_data.get('sql_content', ''),
+                'table_name': query_data.get('table_name', 'unknown_table'),
+                'db_name': query_data.get('db_name', 'unknown_db'),
+                'database': query_data.get('db_name', 'unknown_db'),
+                'hostname_max': hostname_max,
                 'error': str(e),
                 'analysis_status': 'failed'
             }
-    
-    def _analyze_slow_query(self, slow_query_info: Dict) -> Dict:
-        """
-        分析单条慢查询，提取表名，获取数据库配置，调用优化器
-        
-        Args:
-            slow_query_info: 慢查询信息字典，包含ip、db_name、sql_content、execute_cnt、query_time等字段
-            
-        Returns:
-            分析结果字典
-        """
-        try:
-            # 提取慢查询信息
-            ip = slow_query_info.get('ip', '')
-            db_name = slow_query_info.get('db_name', '')
-            sql_content = slow_query_info.get('sql_content', '')
-            execute_cnt = slow_query_info.get('execute_cnt', 0)
-            query_time = slow_query_info.get('query_time', 0.0)
-            
-            # 如果db_name为空，尝试从SQL中提取
-            if not db_name:
-                extracted_db, extracted_table = extract_db_table_from_sql(sql_content)
-                db_name = extracted_db or 'unknown_db'
-            
-            # 获取表名
-            table_name = self.extract_table_name(sql_content)
-            if not table_name:
-                table_name = 'unknown_table'
             
             # 获取数据库配置
             db_config = self._get_database_config(ip, db_name)
@@ -1132,6 +1171,8 @@ EXPLAIN执行计划:
                 'sql': sql_content,
                 'database': db_name,
                 'table': table_name,
+                'table_name': table_name,  # 添加table_name作为table的别名，确保兼容性
+                'hostname_max': hostname_max,
                 'table_structure': table_structure,
                 'explain_result': explain_result,
                 'deepseek_optimization': deepseek_optimization,
@@ -1146,7 +1187,16 @@ EXPLAIN执行计划:
             
         except Exception as e:
             logger.error(f"处理慢查询记录失败: {str(e)}")
-            return None
+            # 确保失败情况下也返回必要的字段
+            return {
+                'sql': sql_content if 'sql_content' in locals() else '',
+                'database': db_name if 'db_name' in locals() else 'unknown_db',
+                'table': table_name if 'table_name' in locals() else 'unknown_table',
+                'table_name': table_name if 'table_name' in locals() else 'unknown_table',
+                'hostname_max': hostname_max if 'hostname_max' in locals() else 'localhost',
+                'error': str(e),
+                'analysis_status': 'failed'
+            }
 
     def compare_slow_queries(self, min_execute_cnt: int = 10, min_query_time: float = 10.0) -> Dict:
         """

@@ -8,22 +8,44 @@
 import json
 import os
 import re
+import sys
 from datetime import datetime
 from typing import Dict, List, Optional
+from collections import defaultdict
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor, Cm, Mm
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_COLOR_INDEX, WD_BREAK
 from docx.oxml.shared import OxmlElement, qn
 from docx.oxml.ns import nsdecls
 
+# 导入拆分后的模块
+from utils import setup_encoding, load_db_config
+from data_masking import DataMasking
+from sql_analyzer import SQLAnalyzer
+from data_processor import DataProcessor
+from database_helper import DatabaseHelper
+from summary_generator import SummaryGenerator
+from report_generator import ReportGenerator
+from report_generator_core import ReportGeneratorCore
+
+# 设置编码
+setup_encoding()
+
 # 添加必要的导入
 from analyze_slow_queries import SlowQueryAnalyzer
+
+# 尝试导入智能优化建议模块（可选）
+try:
+    from intelligent_optimization_suggestions import IntelligentOptimizationSuggestions
+    INTELLIGENT_OPTIMIZER_AVAILABLE = True
+except ImportError:
+    INTELLIGENT_OPTIMIZER_AVAILABLE = False
+    IntelligentOptimizationSuggestions = None
 
 class DatabaseOptimizationReport:
     """数据库智能优化分析报告生成器"""
     
-    def __init__(self, analysis_results_file: str = 'slow_query_analysis_results.json', 
-                 use_live_analysis: bool = False, 
+    def __init__(self, use_live_analysis: bool = False, 
                  slow_query_db_config: Dict = None,  # type: ignore
                  business_db_config: Dict = None,  # type: ignore
                  min_execute_cnt: int = 1000,
@@ -37,6 +59,12 @@ class DatabaseOptimizationReport:
         # 定义需要排除的表名列表
         self.excluded_tables = ['test_table_0']
         
+        # 初始化报告生成器
+        self.report_generator = ReportGenerator(
+            db_connection_manager=business_db_config,
+            excluded_tables=self.excluded_tables
+        )
+        
         # 初始化慢查询数据库连接配置
         self.slow_query_db_host = slow_query_db_config.get('host', '127.0.0.1') if slow_query_db_config else '127.0.0.1'
         self.slow_query_db_user = slow_query_db_config.get('user', 'test') if slow_query_db_config else 'test'
@@ -48,6 +76,26 @@ class DatabaseOptimizationReport:
         self.business_db_user = business_db_config.get('user', 'test') if business_db_config else 'test'
         self.business_db_password = business_db_config.get('password', 'test') if business_db_config else 'test'
         self.business_db_port = business_db_config.get('port', 3306) if business_db_config else 3306
+        
+        # 初始化模块实例
+        self.db_helper = DatabaseHelper(
+            business_db_config=business_db_config,
+            slow_query_db_config=slow_query_db_config
+        )
+
+        # 是否启用新的智能优化建议模块（默认关闭，保持拆分前输出）
+        self.enable_intelligent_optimizer = False
+        
+        # 初始化智能优化建议生成器（如果可用）
+        if INTELLIGENT_OPTIMIZER_AVAILABLE and IntelligentOptimizationSuggestions:
+            try:
+                self.intelligent_optimizer = IntelligentOptimizationSuggestions(
+                    db_helper=self.db_helper
+                )
+            except Exception:
+                self.intelligent_optimizer = None
+        else:
+            self.intelligent_optimizer = None
         
         if not load_data:
             # 不加载外部数据，仅用于测试
@@ -82,12 +130,18 @@ class DatabaseOptimizationReport:
                 # 过滤上个月的数据
                 if 'last_month' in compare_result and 'queries' in compare_result['last_month']:
                     original_last_month_count = len(compare_result['last_month']['queries'])
-                    compare_result['last_month']['queries'] = self._filter_excluded_tables(compare_result['last_month']['queries'])
+                    compare_result['last_month']['queries'] = DataProcessor.filter_excluded_tables(
+                        compare_result['last_month']['queries'], 
+                        self.excluded_tables
+                    )
                 
                 # 过滤前一个月的数据
                 if 'previous_month' in compare_result and 'queries' in compare_result['previous_month']:
                     original_prev_month_count = len(compare_result['previous_month']['queries'])
-                    compare_result['previous_month']['queries'] = self._filter_excluded_tables(compare_result['previous_month']['queries'])
+                    compare_result['previous_month']['queries'] = DataProcessor.filter_excluded_tables(
+                        compare_result['previous_month']['queries'],
+                        self.excluded_tables
+                    )
             
             # 不打印任何慢查询SQL，符合用户要求
             # 原代码已注释掉
@@ -113,1173 +167,214 @@ class DatabaseOptimizationReport:
             # 没有获取到真实数据时抛出错误
             if not self.analysis_data:
                 raise Exception(f"实时分析失败: {str(e)}")
-    
-    def _filter_excluded_tables(self, queries: List[Dict]) -> List[Dict]:
-        """
-        过滤掉包含排除表名的查询
-        
-        Args:
-            queries: 查询列表
-            
-        Returns:
-            过滤后的查询列表
-        """
-        filtered_queries = []
-        
-        for query in queries:
-            sql = query.get('sql', query.get('sql_content', '')).lower()
-            # 检查SQL是否包含任何需要排除的表名
-            contains_excluded_table = False
-            
-            for excluded_table in self.excluded_tables:
-                # 使用正则表达式确保匹配的是完整的表名，避免部分匹配
-                # 表名可能以空格、逗号、点、括号等结尾
-                pattern = r'\b' + re.escape(excluded_table.lower()) + r'\b'
-                if re.search(pattern, sql):
-                    contains_excluded_table = True
-                    break
-            
-            # 如果不包含排除的表名，则保留该查询
-            if not contains_excluded_table:
-                filtered_queries.append(query)
-        
-        return filtered_queries
         
     def _mask_sensitive_data(self, data: List[Dict]) -> List[Dict]:
-
         """对敏感信息进行脱敏处理"""
-        masked_data = []
-        
-        for item in data:
-            # 创建深拷贝，避免修改原始数据
-            masked_item = item.copy()
-            
-            # 脱敏数据库名
-            if 'slow_query_info' in masked_item and 'db_name' in masked_item['slow_query_info']:
-                masked_item['slow_query_info']['db_name'] = self._mask_db_name(masked_item['slow_query_info']['db_name'])
-            
-            # 脱敏IP地址
-            if 'slow_query_info' in masked_item and 'ip' in masked_item['slow_query_info']:
-                masked_item['slow_query_info']['ip'] = self._mask_ip(masked_item['slow_query_info']['ip'])
-            
-            # 脱敏表名
-            if 'table' in masked_item:
-                masked_item['table'] = self._mask_table_name(masked_item['table'])
-            
-            # 脱敏SQL语句中的敏感信息（表名、数据库名等）
-            if 'sql' in masked_item:
-                masked_item['sql'] = self._mask_sql(masked_item['sql'])
-            
-            # 脱敏表结构信息
-            if 'table_structure' in masked_item:
-                masked_item['table_structure'] = self._mask_table_structure(masked_item['table_structure'])
-            
-            masked_data.append(masked_item)
-        
-        return masked_data
+        return DataMasking.mask_sensitive_data(data)
     
+    # 包装方法：调用新模块的方法以保持向后兼容
     def _mask_db_name(self, db_name) -> str:
-        """脱敏数据库名：长度小于6位时保留头两位和尾两位，其余用*替换；长度大于等于6位时保留头3位和尾3位"""
-        # 处理空值或None值
-        if not db_name or db_name == 'None':
-            return '未知'
-        
-        # 确保输入是字符串
-        if not isinstance(db_name, str):
-            db_name = str(db_name)
-        
-        # 处理空字符串
-        if not db_name.strip():
-            return '未知'
-        
-        # 对于所有长度的数据库名都进行脱敏处理
-        if len(db_name) <= 4:
-            # 如果长度小于等于4，显示第1位和最后1位，中间用*替换
-            if len(db_name) <= 2:
-                return db_name  # 长度小于等于2，不脱敏
-            return f"{db_name[0]}{'*' * (len(db_name) - 2)}{db_name[-1]}"
-        elif len(db_name) < 6:
-            # 如果长度为5，显示前2位和后2位，中间用*替换
-            return f"{db_name[:2]}{'*' * (len(db_name) - 4)}{db_name[-2:]}"
-        elif len(db_name) == 6:
-            # 如果长度等于6，显示前2位和后2位，中间用*替换
-            return f"{db_name[:2]}{'*' * (len(db_name) - 4)}{db_name[-2:]}"
-        else:
-            # 严格显示头3位和尾3位，中间用*替换
-            return f"{db_name[:3]}{'*' * (len(db_name) - 6)}{db_name[-3:]}"
+        """脱敏数据库名（包装方法）"""
+        return DataMasking.mask_db_name(db_name)
     
     def _mask_ip(self, ip) -> str:
-        """脱敏IP地址：长度小于6位时保留头两位和尾两位，其余用*替换；长度大于等于6位时保留头3位和尾3位"""
-        # 确保输入是字符串
-        if not isinstance(ip, str):
-            ip = str(ip)
-        
-        if len(ip) <= 4:
-            # 如果长度小于等于4，显示第1位和最后1位，中间用*替换
-            if len(ip) <= 2:
-                return ip  # 长度小于等于2，不脱敏
-            return f"{ip[0]}{'*' * (len(ip) - 2)}{ip[-1]}"
-        elif len(ip) < 6:
-            # 如果长度为5，显示前2位和后2位，中间用*替换
-            return f"{ip[:2]}{'*' * (len(ip) - 4)}{ip[-2:]}"
-        elif len(ip) == 6:
-            # 如果长度等于6，显示前2位和后2位，中间用*替换
-            return f"{ip[:2]}{'*' * (len(ip) - 4)}{ip[-2:]}"
-        else:
-            # 严格显示头3位和尾3位，中间用*替换
-            return f"{ip[:3]}{'*' * (len(ip) - 6)}{ip[-3:]}"
+        """脱敏IP地址（包装方法）"""
+        return DataMasking.mask_ip(ip)
     
     def _mask_table_name(self, table_name) -> str:
-        """脱敏表名：长度小于6位时保留头两位和尾两位，其余用*替换；长度大于等于6位时保留头3位和尾3位"""
-        # 确保输入是字符串
-        if not isinstance(table_name, str):
-            table_name = str(table_name)
-        
-        # 将表名转换为小写
-        table_name = table_name.lower()
-        
-        if len(table_name) <= 4:
-            # 如果长度小于等于4，显示第1位和最后1位，中间用*替换
-            if len(table_name) <= 2:
-                return table_name  # 长度小于等于2，不脱敏
-            return f"{table_name[0]}{'*' * (len(table_name) - 2)}{table_name[-1]}"
-        elif len(table_name) < 6:
-            # 如果长度为5，显示前2位和后2位，中间用*替换
-            return f"{table_name[:2]}{'*' * (len(table_name) - 4)}{table_name[-2:]}"
-        elif len(table_name) == 6:
-            # 如果长度等于6，显示前2位和后2位，中间用*替换
-            return f"{table_name[:2]}{'*' * (len(table_name) - 4)}{table_name[-2:]}"
-        else:
-            # 严格显示头3位和尾3位，中间用*替换
-            return f"{table_name[:3]}{'*' * (len(table_name) - 6)}{table_name[-3:]}"
+        """脱敏表名（包装方法）"""
+        return DataMasking.mask_table_name(table_name)
     
     def _mask_sql(self, sql) -> str:
-        """脱敏SQL语句中的敏感信息，处理可能的非字符串输入"""
-        # 确保输入是字符串
-        if not isinstance(sql, str):
-            sql = str(sql)
-        
-        # 脱敏表名模式匹配
-        table_patterns = [
-            r'(FROM|JOIN)\s+([`\[\"]?\w+[`\]\"]?)',
-            r'(ALTER|CREATE|DROP|TRUNCATE)\s+TABLE\s+([`\[\"]?\w+[`\]\"]?)',
-            r'(INSERT\s+INTO|UPDATE)\s+([`\[\"]?\w+[`\]\"]?)'
-        ]
-        
-        masked_sql = sql
-        
-        for pattern in table_patterns:
-            matches = re.finditer(pattern, masked_sql, re.IGNORECASE)
-            # 从后向前替换，避免位置偏移
-            replacements = []
-            for match in matches:
-                prefix = match.group(1)
-                table_name = match.group(2)
-                # 移除可能的引号
-                clean_table = re.sub(r'[`\[\"]', '', table_name)
-                masked_table = self._mask_table_name(clean_table)
-                # 恢复引号
-                if table_name.startswith('`') and table_name.endswith('`'):
-                    masked_table = f'`{masked_table}`'
-                elif table_name.startswith('[') and table_name.endswith(']'):
-                    masked_table = f'[{masked_table}]'
-                elif table_name.startswith('"') and table_name.endswith('"'):
-                    masked_table = f'"{masked_table}"'
-                
-                replacements.append((match.start(), match.end(), f'{prefix} {masked_table}'))
-            
-            # 从后向前替换
-            for start, end, replacement in reversed(replacements):
-                masked_sql = masked_sql[:start] + replacement + masked_sql[end:]
-        
-        # 脱敏数据库名
-        db_pattern = r'(\`\w+\`|\w+)\.(\`\w+\`|\w+)'  # 匹配db.table格式
-        matches = re.finditer(db_pattern, masked_sql)
-        replacements = []
-        
-        for match in matches:
-            db_name = match.group(1)
-            table_name = match.group(2)
-            
-            # 移除可能的引号
-            clean_db = re.sub(r'[`\[\"]', '', db_name)
-            clean_table = re.sub(r'[`\[\"]', '', table_name)
-            
-            masked_db = self._mask_db_name(clean_db)
-            masked_table = self._mask_table_name(clean_table)
-            
-            # 恢复引号
-            if db_name.startswith('`') and db_name.endswith('`'):
-                masked_db = f'`{masked_db}`'
-            if table_name.startswith('`') and table_name.endswith('`'):
-                masked_table = f'`{masked_table}`'
-            
-            replacements.append((match.start(), match.end(), f'{masked_db}.{masked_table}'))
-        
-        # 从后向前替换
-        for start, end, replacement in reversed(replacements):
-            masked_sql = masked_sql[:start] + replacement + masked_sql[end:]
-        
-        return masked_sql
+        """脱敏SQL语句（包装方法）"""
+        return DataMasking.mask_sql(sql)
         
     def _extract_table_name(self, sql: str) -> Optional[str]:
-        """从SQL语句中提取表名
-        
-        Args:
-            sql: SQL语句字符串
-            
-        Returns:
-            提取的表名，如果无法提取则返回None
-        """
-        if not sql:
-            return None
-            
-        sql_clean = sql.strip()
-        sql_upper = sql_clean.upper()
-        
-        # 移除SQL语句末尾的分号
-        if sql_upper.endswith(';'):
-            sql_upper = sql_upper[:-1].strip()
-        
-        # 更全面的表名提取模式
-        patterns = [
-            # SELECT ... FROM table (支持别名和空格)
-            r'FROM\s+`?([a-zA-Z0-9_]+)`?(?:\s+AS\s+\w+|\s+\w+)?(?:\s+WHERE|\s+ORDER|\s+GROUP|\s+LIMIT|\s+JOIN|$)',
-            # SELECT ... FROM table WHERE
-            r'FROM\s+`?([a-zA-Z0-9_]+)`?\s+WHERE',
-            # INSERT INTO table
-            r'INSERT\s+INTO\s+`?([a-zA-Z0-9_]+)`?',
-            # UPDATE table
-            r'UPDATE\s+`?([a-zA-Z0-9_]+)`?',
-            # DELETE FROM table
-            r'DELETE\s+FROM\s+`?([a-zA-Z0-9_]+)`?',
-            # 简单的FROM table模式（作为后备）
-            r'FROM\s+`?([a-zA-Z0-9_]+)`?',
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, sql_upper, re.IGNORECASE)
-            if match:
-                table_name = match.group(1)
-                # 排除SQL关键字
-                if table_name.upper() not in ['SELECT', 'WHERE', 'JOIN', 'INNER', 'LEFT', 'RIGHT', 'OUTER', 'AND', 'OR']:
-                    return table_name
-        
-        return None
-    
-    def _debug_extract_where_fields(self, sql: str) -> dict:
-        """调试版本：从SQL语句中提取WHERE条件中的字段名，包含详细分析
-        
-        Args:
-            sql: SQL语句字符串
-            
-        Returns:
-            包含详细分析结果的字典
-        """
-        print(f"\n=== 调试：提取WHERE字段 ===")
-        print(f"原始SQL: {sql}")
-        
-        if not sql:
-            return {'fields': [], 'analysis': '空SQL'}
-        
-        # 移除SQL语句末尾的分号
-        sql_clean = sql.strip()
-        if sql_clean.endswith(';'):
-            sql_clean = sql_clean[:-1].strip()
-        
-        print(f"清理后SQL: {sql_clean}")
-        
-        # 查找WHERE子句
-        where_match = re.search(r'\bWHERE\s+(.+?)(?:\s+ORDER\s+BY|\s+GROUP\s+BY|\s+LIMIT|$)', sql_clean, re.IGNORECASE | re.DOTALL)
-        if not where_match:
-            print("未找到WHERE子句")
-            return {'fields': [], 'analysis': '未找到WHERE子句'}
-        
-        where_clause = where_match.group(1).strip()
-        print(f"WHERE子句: {where_clause}")
-        
-        # 🎯 修复：分离AND条件和OR条件，优先选择AND字段
-        and_conditions = []
-        or_conditions = []
-        
-        # 按OR分割，然后分别处理每个部分
-        # 注意：需要正确处理复杂的OR条件，如 "a=1 and b=2 or c=3 or d=4 and f=5"
-        or_parts = re.split(r'\bOR\b', where_clause, flags=re.IGNORECASE)
-        
-        print(f"OR分割结果: {or_parts}")
-        
-        for i, part in enumerate(or_parts):
-            part = part.strip()
-            print(f"第{i}部分: '{part}'")
-            if i == 0:
-                # 第一个部分是纯AND条件（可能包含多个AND连接的条件）
-                and_conditions.append(part)
-                print(f"  -> 添加到AND条件")
-            else:
-                # 其他部分是OR条件，但每个OR部分内部可能还有AND条件
-                # 我们需要提取这些OR部分中的所有字段
-                or_conditions.append(part)
-                print(f"  -> 添加到OR条件")
-        
-        # 提取字段名（包括函数字段检测）
-        fields = []
-        and_fields = []
-        or_fields = []
-        
-        print(f"\n=== 提取AND条件字段 ===")
-        # 提取AND条件中的字段
-        for and_part in and_conditions:
-            print(f"处理AND部分: '{and_part}'")
-            extracted_fields = self._extract_fields_from_condition(and_part)
-            print(f"提取到的字段: {extracted_fields}")
-            and_fields.extend(extracted_fields)
-        
-        print(f"\n=== 提取OR条件字段 ===")
-        # 提取OR条件中的字段
-        for or_part in or_conditions:
-            print(f"处理OR部分: '{or_part}'")
-            extracted_fields = self._extract_fields_from_condition(or_part)
-            print(f"提取到的字段: {extracted_fields}")
-            or_fields.extend(extracted_fields)
-        
-        print(f"\nAND字段列表: {and_fields}")
-        print(f"OR字段列表: {or_fields}")
-        
-        # 🎯 修复：优先选择AND字段，当AND字段不足5个时再选择OR字段
-        # 去重并保持顺序
-        unique_and_fields = []
-        seen = set()
-        for field in and_fields:
-            if field not in seen:
-                unique_and_fields.append(field)
-                seen.add(field)
-        
-        unique_or_fields = []
-        for field in or_fields:
-            if field not in seen:
-                unique_or_fields.append(field)
-                seen.add(field)
-        
-        print(f"去重后AND字段: {unique_and_fields}")
-        print(f"去重后OR字段: {unique_or_fields}")
-        
-        # 🎯 修复：优先选择AND字段，当AND字段不足5个时再选择OR字段
-        # 如果AND字段已经有5个或以上，只取前5个AND字段，不再添加OR字段
-        if len(unique_and_fields) >= 5:
-            fields = unique_and_fields[:5]
-            print(f"AND字段>=5个，只取AND字段: {fields}")
-            
-            # 🎯 修复：即使AND字段足够，也要检查是否能替换为更优的OR字段（如f字段）
-            if 'f' in unique_or_fields and 'c' in fields:
-                # 如果f字段在OR条件中且c字段在AND条件中，考虑用f替换c
-                print(f"发现f字段在OR条件中，考虑优化字段选择...")
-                # 这里可以添加更复杂的替换逻辑
-        else:
-            # AND字段不足5个，用OR字段补充到5个
-            # 🎯 修复：当需要选择OR字段时，优先选择f字段（如果存在）
-            needed_or_count = 5 - len(unique_and_fields)
-            
-            # 重新排序OR字段，优先选择f字段
-            prioritized_or_fields = []
-            f_field = None
-            other_or_fields = []
-            
-            for field in unique_or_fields:
-                if field == 'f':
-                    f_field = field
-                else:
-                    other_or_fields.append(field)
-            
-            # 优先添加f字段，然后添加其他OR字段
-            if f_field:
-                prioritized_or_fields.append(f_field)
-            prioritized_or_fields.extend(other_or_fields)
-            
-            fields = unique_and_fields + prioritized_or_fields[:needed_or_count]
-            print(f"AND字段<5个，用OR字段补充（优先f字段）: {fields}")
-        
-        return {
-            'fields': fields,
-            'and_fields': unique_and_fields,
-            'or_fields': unique_or_fields,
-            'analysis': f'最终字段: {fields}'
-        }
+        """从SQL语句中提取表名（包装方法）"""
+        return SQLAnalyzer.extract_table_name(sql)
 
     def _extract_where_fields(self, sql: str) -> List[str]:
-        """从SQL语句中提取WHERE条件中的字段名，包括函数字段检测
-        
-        Args:
-            sql: SQL语句字符串
-            
-        Returns:
-            WHERE条件中的字段名列表，包含函数字段信息
-        """
-        if not sql:
-            return []
-        
-        # 移除SQL语句末尾的分号
-        sql_clean = sql.strip()
-        if sql_clean.endswith(';'):
-            sql_clean = sql_clean[:-1].strip()
-        
-        # 查找WHERE子句
-        where_match = re.search(r'\bWHERE\s+(.+?)(?:\s+ORDER\s+BY|\s+GROUP\s+BY|\s+LIMIT|$)', sql_clean, re.IGNORECASE | re.DOTALL)
-        if not where_match:
-            return []
-        
-        where_clause = where_match.group(1).strip()
-        
-        # 🎯 修复：分离AND条件和OR条件，优先选择AND字段
-        and_conditions = []
-        or_conditions = []
-        
-        # 按OR分割，然后分别处理每个部分
-        # 注意：需要正确处理复杂的OR条件，如 "a=1 and b=2 or c=3 or d=4 and f=5"
-        or_parts = re.split(r'\bOR\b', where_clause, flags=re.IGNORECASE)
-        
-        for i, part in enumerate(or_parts):
-            part = part.strip()
-            if i == 0:
-                # 第一个部分是主条件，可能包含AND连接的条件
-                # 检查这部分是否包含AND条件，如果包含则作为AND条件
-                if re.search(r'\bAND\b', part, re.IGNORECASE):
-                    and_conditions.append(part)
-                else:
-                    # 单个条件也作为AND条件处理
-                    and_conditions.append(part)
-            else:
-                # 其他部分是OR条件，但每个OR部分内部可能还有AND条件
-                # 我们需要提取这些OR部分中的所有字段
-                or_conditions.append(part)
-        
-        # 提取字段名（包括函数字段检测）
-        fields = []
-        and_fields = []
-        or_fields = []
-        
-        # 提取AND条件中的字段
-        for and_part in and_conditions:
-            and_fields.extend(self._extract_fields_from_condition(and_part))
-        
-        # 提取OR条件中的字段
-        for or_part in or_conditions:
-            or_fields.extend(self._extract_fields_from_condition(or_part))
-        
-        # 🎯 修复：优先选择AND字段，当AND字段不足5个时再选择OR字段
-        # 去重并保持顺序
-        unique_and_fields = []
-        seen = set()
-        for field in and_fields:
-            if field not in seen:
-                unique_and_fields.append(field)
-                seen.add(field)
-        
-        unique_or_fields = []
-        for field in or_fields:
-            if field not in seen:
-                unique_or_fields.append(field)
-                seen.add(field)
-        
-        # 🎯 修复：优先选择AND字段，当AND字段不足5个时再选择OR字段
-        # 如果AND字段已经有5个或以上，只取前5个AND字段，不再添加OR字段
-        if len(unique_and_fields) >= 5:
-            fields = unique_and_fields[:5]
-        else:
-            # AND字段不足5个，用OR字段补充到5个
-            # 🎯 修复：当需要选择OR字段时，优先选择f字段（如果存在）
-            needed_or_count = 5 - len(unique_and_fields)
-            
-            # 重新排序OR字段，优先选择f字段
-            prioritized_or_fields = []
-            f_field = None
-            other_or_fields = []
-            
-            for field in unique_or_fields:
-                if field == 'f':
-                    f_field = field
-                else:
-                    other_or_fields.append(field)
-            
-            # 优先添加f字段，然后添加其他OR字段
-            if f_field:
-                prioritized_or_fields.append(f_field)
-            prioritized_or_fields.extend(other_or_fields)
-            
-            fields = unique_and_fields + prioritized_or_fields[:needed_or_count]
-        
-        return fields
+        """从SQL语句中提取WHERE条件中的字段名（包装方法）"""
+        return SQLAnalyzer.extract_where_fields(sql)
     
     def _extract_fields_from_condition(self, condition: str) -> List[str]:
-        """从单个条件中提取字段名
-        
-        Args:
-            condition: 单个条件字符串
-            
-        Returns:
-            字段名列表
-        """
-        fields = []
-        
-        # 模式1：匹配函数字段，如 LOWER(name), UPPER(column)
-        function_pattern = r'\b([A-Za-z_]+)\s*\(\s*([a-zA-Z_]\w*)\s*\)'
-        function_matches = re.findall(function_pattern, condition)
-        
-        for func_name, field_name in function_matches:
-            # 标记为函数字段，格式为 "函数名(字段名)"
-            func_field = f"{func_name.upper()}({field_name})"
-            if func_field.upper() not in ['SELECT', 'FROM', 'WHERE', 'AND', 'OR']:
-                fields.append(func_field)
-        
-        # 模式2：匹配普通字段名，如 name = 'value'
-        field_pattern = r'\b([a-zA-Z_]\w*)\s*[=<>!]+'
-        matches = re.findall(field_pattern, condition)
-        
-        for field in matches:
-            # 排除SQL关键字和已经提取的函数字段
-            field_upper = field.upper()
-            if field_upper not in ['SELECT', 'FROM', 'WHERE', 'AND', 'OR', 'NOT', 'IN', 'LIKE', 'BETWEEN']:
-                # 检查这个字段是否已经是函数字段的一部分
-                is_in_function = False
-                for func_field in fields:
-                    if field in func_field:
-                        is_in_function = True
-                        break
-                if not is_in_function:
-                    fields.append(field)
-        
-        return fields
+        """从单个条件中提取字段名（包装方法）"""
+        return SQLAnalyzer.extract_fields_from_condition(condition)
     
     def _extract_join_fields(self, sql: str) -> List[str]:
-        """从SQL语句中提取JOIN条件中的字段名
-        
-        Args:
-            sql: SQL语句字符串
-            
-        Returns:
-            JOIN条件中的字段名列表
-        """
-        if not sql:
-            return []
-        
-        # 移除SQL语句末尾的分号
-        sql_clean = sql.strip()
-        if sql_clean.endswith(';'):
-            sql_clean = sql_clean[:-1].strip()
-        
-        # 查找JOIN子句
-        join_pattern = r'\b(?:INNER|LEFT|RIGHT|FULL)?\s*JOIN\s+\w+\s+ON\s+(.+?)(?:\s+(?:LEFT|RIGHT|INNER|JOIN|WHERE|ORDER|GROUP|LIMIT)|\s*$)'
-        join_matches = re.findall(join_pattern, sql_clean, re.IGNORECASE | re.DOTALL)
-        
-        fields = []
-        for join_condition in join_matches:
-            # 提取ON条件中的字段名
-            field_pattern = r'\b([a-zA-Z_]\w*)\s*[=<>!]+'
-            matches = re.findall(field_pattern, join_condition)
-            
-            for field in matches:
-                # 排除SQL关键字
-                if field.upper() not in ['SELECT', 'FROM', 'WHERE', 'AND', 'OR', 'NOT', 'IN', 'LIKE', 'BETWEEN', 'ON']:
-                    fields.append(field)
-        
-        return list(set(fields))  # 去重
+        """从SQL语句中提取JOIN条件中的字段名（包装方法）"""
+        return SQLAnalyzer.extract_join_fields(sql)
     
     def _extract_order_by_fields(self, sql: str) -> List[str]:
-        """从SQL语句中提取ORDER BY子句中的字段名
-        
-        Args:
-            sql: SQL语句字符串
-            
-        Returns:
-            ORDER BY子句中的字段名列表
-        """
-        if not sql:
-            return []
-        
-        # 移除SQL语句末尾的分号
-        sql_clean = sql.strip()
-        if sql_clean.endswith(';'):
-            sql_clean = sql_clean[:-1].strip()
-        
-        # 查找ORDER BY子句
-        order_match = re.search(r'\bORDER\s+BY\s+(.+?)(?:\s+LIMIT|$)', sql_clean, re.IGNORECASE | re.DOTALL)
-        if not order_match:
-            return []
-        
-        order_clause = order_match.group(1).strip()
-        
-        # 提取字段名
-        fields = []
-        # 匹配字段名模式：table.column 或 column (支持DESC/ASC)
-        field_pattern = r'\b([a-zA-Z_]\w*)\s*(?:DESC|ASC)?\s*(?:,|$)'
-        matches = re.findall(field_pattern, order_clause)
-        
-        for field in matches:
-            # 排除SQL关键字
-            if field.upper() not in ['SELECT', 'FROM', 'WHERE', 'AND', 'OR', 'ORDER', 'BY', 'DESC', 'ASC']:
-                fields.append(field)
-        
-        return list(set(fields))  # 去重
+        """从SQL语句中提取ORDER BY子句中的字段名（包装方法）"""
+        return SQLAnalyzer.extract_order_by_fields(sql)
     
     def _sort_fields_by_priority(self, fields: List[str], sql_lower: str) -> List[str]:
-        """
-        智能排序字段优先级，基于字段类型和业务场景
-        
-        Args:
-            fields: 字段列表
-            sql_lower: 小写的SQL语句
-            
-        Returns:
-            按优先级排序的字段列表
-        """
-        if not fields:
-            return []
-        
-        # 字段优先级权重
-        field_weights = {}
-        
-        for field in fields:
-            field_lower = field.lower()
-            weight = 0
-            
-            # 主键字段最高优先级
-            if field_lower in ['id', 'pk', 'primary_key']:
-                weight += 100
-            elif field_lower.endswith('_id'):
-                weight += 90
-            
-            # 时间字段较高优先级
-            if field_lower in ['date', 'time', 'created', 'updated', 'timestamp']:
-                weight += 80
-            elif field_lower.endswith('_date') or field_lower.endswith('_time'):
-                weight += 70
-            
-            # 状态/类型字段中等优先级
-            if field_lower in ['status', 'state', 'type', 'category']:
-                weight += 60
-            elif field_lower.endswith('_status') or field_lower.endswith('_type'):
-                weight += 50
-            
-            # 高频业务字段
-            if field_lower in ['user', 'name', 'title', 'code']:
-                weight += 40
-            
-            # 基础权重
-            weight += len(field)  # 字段长度（短字段通常更重要）
-            
-            # 在SQL中的出现频率
-            frequency = sql_lower.count(field_lower)
-            weight += frequency * 5
-            
-            field_weights[field] = weight
-        
-        # 按权重降序排序
-        sorted_fields = sorted(fields, key=lambda f: field_weights.get(f, 0), reverse=True)
-        return sorted_fields
+        """智能排序字段优先级（包装方法）"""
+        return SQLAnalyzer.sort_fields_by_priority(fields, sql_lower)
     
     
     def _get_standby_hostname(self, master_hostname: str) -> Optional[str]:
-        """
-        通过cluster表查询获取备库IP地址
-        
-        Args:
-            master_hostname: 主库主机名/IP
-            
-        Returns:
-            Optional[str]: 备库IP地址，如果未找到返回None
-        """
-        if not master_hostname:
-            return None
-            
-        import pymysql
-        
-        try:
-            # 连接到t数据库查询cluster表（使用业务数据库连接配置）
-            conn = pymysql.connect(
-                host=self.business_db_host,
-                port=self.business_db_port,
-                user=self.business_db_user,
-                password=self.business_db_password,
-                database='t',
-                charset='utf8mb4',
-                connect_timeout=5
-            )
-            
-            with conn.cursor() as cursor:
-                # 查询cluster表获取主库信息
-                cursor.execute(
-                    """SELECT cluster_name FROM cluster 
-                       WHERE ip = %s AND instance_role = 'M'""",
-                    (master_hostname,)
-                )
-                master_result = cursor.fetchone()
-                
-                if not master_result:
-                    print(f"❌ 在cluster表中未找到主库 {master_hostname} 的记录")
-                    conn.close()
-                    return None
-                
-                cluster_name = master_result[0]
-                
-                # 查询同集群的备库
-                cursor.execute(
-                    """SELECT ip FROM cluster 
-                       WHERE cluster_name = %s AND instance_role = 'S'""",
-                    (cluster_name,)
-                )
-                standby_results = cursor.fetchall()
-                
-                if not standby_results:
-                    print(f"❌ 集群 {cluster_name} 未找到备库记录")
-                    conn.close()
-                    return None
-                
-                # 返回第一个备库IP（通常只有一个备库）
-                standby_hostname = standby_results[0][0]
-                
-                conn.close()
-                return standby_hostname
-                
-        except Exception as e:
-            print(f"❌ 查询cluster表获取备库信息失败: {str(e)}")
-            return None
+        """通过cluster表查询获取备库IP地址（包装方法）"""
+        return self.db_helper.get_standby_hostname(master_hostname)
 
     def _get_safe_connection(self, hostname: str = None, database: str = None) -> dict:
-        """
-        安全地获取数据库连接，添加保护层
-        
-        Returns:
-            dict: 包含连接状态和连接对象的字典
-        """
-        import pymysql
-        
-        # 🎯 优先使用备库避免主库性能风险（使用业务数据库配置）
-        original_host = hostname if hostname and hostname != 'localhost' else self.business_db_host
-        
-        # 尝试获取备库IP
-        standby_host = self._get_standby_hostname(original_host)
-        
-        if standby_host:
-            host = standby_host
-        else:
-            host = original_host
-            print(f"⚠️ 未找到备库信息，使用原主机: {original_host}")
-        
-        # 检查是否已经有活跃连接（限制只有一个连接）
-        if hasattr(self, '_active_connection') and self._active_connection:
-            return {
-                'status': 'error',
-                'message': '已存在活跃数据库连接，不允许创建新连接',
-                'connection': None
-            }
-        
-        connection = None
-        try:
-            # 首先创建一个连接来检查系统状态（使用业务数据库配置）
-            check_conn = pymysql.connect(
-                host=host,
-                port=self.business_db_port,
-                user=self.business_db_user,
-                password=self.business_db_password,
-                charset='utf8mb4',
-                connect_timeout=5
-            )
-            
-            with check_conn.cursor() as cursor:
-                # 1. 检查活跃会话数是否超过10
-                cursor.execute("SELECT COUNT(*) as active_sessions FROM information_schema.processlist WHERE command != 'Sleep'")
-                result = cursor.fetchone()
-                active_sessions = result[0] if result else 0
-                
-                if active_sessions > 10:
-                    check_conn.close()
-                    return {
-                        'status': 'error',
-                        'message': f'数据库活跃会话数({active_sessions})超过10，暂不执行操作',
-                        'connection': None
-                    }
-                
-                # 2. 检查当前用户权限，确保只有查询权限
-                cursor.execute("SELECT * FROM information_schema.user_privileges WHERE grantee LIKE %s AND privilege_type IN ('SELECT', 'SELECT, INSERT, UPDATE, DELETE')", 
-                             (f"'%{self.business_db_user}%'",))
-                privileges = cursor.fetchall()
-                
-                has_write_privilege = any('INSERT' in str(priv) or 'UPDATE' in str(priv) or 'DELETE' in str(priv) for priv in privileges)
-                if has_write_privilege:
-                    # 重新连接，设置会话参数（使用业务数据库配置）
-                    check_conn.close()
-                    connection = pymysql.connect(
-                        host=host,
-                        port=self.business_db_port,
-                        user=self.business_db_user,
-                        password=self.business_db_password,
-                        charset='utf8mb4',
-                        connect_timeout=5,
-                        init_command="SET SESSION sql_mode='STRICT_TRANS_TABLES,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION'"
-                    )
-                else:
-                    connection = pymysql.connect(
-                        host=host,
-                        port=self.business_db_port,
-                        user=self.business_db_user,
-                        password=self.business_db_password,
-                        charset='utf8mb4',
-                        connect_timeout=5
-                    )
-            
-            # 设置连接为只读模式
-            with connection.cursor() as cursor:
-                cursor.execute("SET SESSION sql_safe_updates=1")
-                cursor.execute("SET SESSION sql_select_limit=1000")  # 限制查询结果集大小
-                
-            # 记录活跃连接
-            self._active_connection = connection
-            
-            return {
-                'status': 'success',
-                'message': '数据库连接创建成功',
-                'connection': connection
-            }
-            
-        except Exception as e:
-            # 清理连接
-            if 'check_conn' in locals() and check_conn:
-                try:
-                    check_conn.close()
-                except:
-                    pass
-            if connection:
-                try:
-                    connection.close()
-                except:
-                    pass
-            
-            return {
-                'status': 'error',
-                'message': f'数据库连接失败: {str(e)}',
-                'connection': None
-            }
+        """安全地获取数据库连接（包装方法）"""
+        return self.db_helper.get_safe_connection(hostname, database)
     
     def _close_safe_connection(self):
-        """安全关闭数据库连接"""
-        if hasattr(self, '_active_connection') and self._active_connection:
-            try:
-                self._active_connection.close()
-                self._active_connection = None
-            except:
-                pass
+        """安全关闭数据库连接（包装方法）"""
+        self.db_helper.close_safe_connection()
     
     def _execute_safe_query(self, query: str, params: tuple = None, hostname: str = None, database: str = None) -> dict:
-        """
-        安全执行数据库查询
-        
-        Args:
-            query: SQL查询语句
-            params: 查询参数
-            hostname: 主机名
-            database: 数据库名
-            
-        Returns:
-            dict: 查询结果
-        """
-        # 检查查询语句是否包含危险操作
-        dangerous_keywords = ['INSERT', 'UPDATE', 'DELETE', 'DROP', 'CREATE', 'ALTER', 'TRUNCATE']
-        if any(keyword in query.upper() for keyword in dangerous_keywords):
-            print("⚠️ 查询被拒绝：包含危险操作")
-            return {
-                'status': 'error',
-                'message': '查询包含危险操作，仅允许SELECT查询',
-                'data': None
-            }
-        
-        # 检查是否全表扫描（没有WHERE条件的SELECT）
-        if query.upper().startswith('SELECT') and 'WHERE' not in query.upper():
-            # 简单查询可以允许，但复杂查询需要检查
-            if 'JOIN' in query.upper() or 'FROM' in query.upper() and query.upper().count('FROM') > 1:
-                print("⚠️ 查询被拒绝：可能涉及全表扫描")
-                return {
-                    'status': 'error',
-                    'message': '查询可能涉及全表扫描，请添加适当的WHERE条件',
-                    'data': None
-                }
-        
-        # 获取安全连接
-        conn_result = self._get_safe_connection(hostname, database)
-        if conn_result['status'] != 'success':
-            print(f"❌ 连接失败: {conn_result.get('message', '未知错误')}")
-            return conn_result
-        
-        connection = conn_result['connection']
-        
-        try:
-            with connection.cursor() as cursor:
-                # 如果指定了数据库，先选择数据库
-                if database:
-                    cursor.execute(f"USE `{database}`")
-                
-                cursor.execute(query, params)
-                result = cursor.fetchall()
-                
-                return {
-                    'status': 'success',
-                    'message': '查询执行成功',
-                    'data': result
-                }
-                
-        except Exception as e:
-            print(f"❌ 查询执行异常: {str(e)}")
-            return {
-                'status': 'error',
-                'message': f'查询执行失败: {str(e)}',
-                'data': None
-            }
-        finally:
-            self._close_safe_connection()
+        """安全执行数据库查询（包装方法）"""
+        return self.db_helper.execute_safe_query(query, params, hostname, database)
     
     def _get_table_row_count(self, database: str, table_name: str, hostname: str = None) -> Optional[int]:
         """
-        获取表的行数（使用直接数据库连接，通过hostname_max获取数据库IP，访问实际数据库）
-        
-        Args:
-            database: 数据库名称（作为参考）
-            table_name: 表名
-            hostname: 主机名（可选），如果提供则使用该主机获取数据库IP
-            
-        Returns:
-            Optional[int]: 表的行数，如果查询失败返回None
+        获取表的行数（使用hostname_max连接真实业务数据库）
         """
         if not table_name:
             return None
         
-        import pymysql
-        
-        try:
-            # 通过hostname_max获取数据库IP，如果没有提供则使用默认配置
-            if hostname and hostname != 'localhost':
-                db_host = hostname
-            else:
-                db_host = getattr(self, 'slow_query_db_host', '127.0.0.1')
-            
-            # 首先查找表所在的实际数据库
-            actual_database = database
-            if database:
-                # 检查传入的数据库是否包含该表
-                if not self._check_table_exists(database, table_name, hostname):
-                    # 如果传入的数据库不包含该表，尝试查找正确的数据库
-                    found_database = self._find_correct_database_for_table(table_name, hostname)
-                    if found_database:
-                        actual_database = found_database
-                        print(f"ℹ️ 找到表 {table_name} 所在的实际数据库: {actual_database}")
-                    else:
-                        print(f"⚠️ 无法找到表 {table_name} 所在的数据库，使用传入的数据库: {database}")
-                        actual_database = database
-                else:
-                    actual_database = database
-            else:
-                # 如果没有传入数据库，必须查找正确的数据库
-                found_database = self._find_correct_database_for_table(table_name, hostname)
+        actual_database = database
+        if database:
+            if not self.db_helper.check_table_exists(database, table_name, hostname):
+                found_database = self.db_helper.find_correct_database_for_table(table_name, hostname)
                 if found_database:
                     actual_database = found_database
+                    print(f"ℹ️ 找到表 {table_name} 所在的实际数据库: {actual_database} (hostname: {hostname})")
                 else:
-                    print(f"❌ 未提供数据库名且无法找到表 {table_name} 所在的数据库")
-                    return None
-            
-            # 直接创建连接获取表信息，使用实际数据库
-            conn = pymysql.connect(
-                host=db_host,
-                port=getattr(self, 'slow_query_db_port', 3306),
-                user=getattr(self, 'slow_query_db_user', 'test'),
-                password=getattr(self, 'slow_query_db_password', 'test'),
-                charset='utf8mb4',
-                connect_timeout=5
-            )
-            
-            with conn.cursor() as cursor:
-                # 首先通过information_schema获取表的基本信息
-                cursor.execute(
-                    """SELECT data_length, index_length, engine 
-                       FROM information_schema.tables 
-                       WHERE table_schema = %s AND table_name = %s""",
-                    (actual_database, table_name)
-                )
-                size_result = cursor.fetchone()
-                
-                if not size_result:
-                    print(f"⚠️ 无法在数据库 {actual_database} 中找到表 {table_name}")
-                    conn.close()
-                    return None
-                
-                data_length = size_result[0] or 0
-                index_length = size_result[1] or 0
-                engine = size_result[2] or 'InnoDB'
-                
-                print(f"ℹ️ 表 {table_name} 信息: 数据长度={data_length}, 索引长度={index_length}, 引擎={engine}")
-                
-                # 对于大表，使用information_schema的估算值
-                cursor.execute(
-                    """SELECT table_rows 
-                       FROM information_schema.tables 
-                       WHERE table_schema = %s AND table_name = %s""",
-                    (actual_database, table_name)
-                )
-                rows_result = cursor.fetchone()
-                
-                if rows_result and rows_result[0]:
-                    estimated_rows = rows_result[0]
-                    if estimated_rows is not None and estimated_rows > 0:
-                        print(f"ℹ️ 使用information_schema估算表 {table_name} 行数: {{:,}} (估算值)".format(estimated_rows))
-                        conn.close()
-                        return estimated_rows
-                
-                # 如果information_schema不可用，尝试使用SHOW TABLE STATUS
-                cursor.execute(f"SHOW TABLE STATUS FROM `{actual_database}` LIKE '{table_name}'")
-                table_status_result = cursor.fetchone()
-                
-                if table_status_result and len(table_status_result) > 4:
-                    estimated_rows = table_status_result[4]  # Rows字段
-                    if estimated_rows is not None and estimated_rows > 0:
-                        print(f"ℹ️ 使用SHOW TABLE STATUS估算表 {table_name} 行数: {{:,}} (估算值)".format(estimated_rows))
-                        conn.close()
-                        return estimated_rows
-                
-                # 对于大表，如果上述方法都失败，根据数据长度进行估算
-                if data_length > 100 * 1024 * 1024:  # >100MB
-                    # 根据经验，假设平均每行1KB，这只是一个粗略估算
-                    rough_estimate = data_length // 1024
-                    print(f"⚠️ 表 {table_name} 数据量较大 ({{:.1f}}MB)，使用粗略估算: {{:,}}行".format(data_length / 1024 / 1024, rough_estimate))
-                    conn.close()
-                    return rough_estimate if rough_estimate > 0 else 10000  # 最小返回10000
-                
-                conn.close()
-                print(f"⚠️ 无法获取表 {table_name} 的行数，返回None")
+                    print(f"⚠️ 无法找到表 {table_name} 所在的数据库，使用传入的数据库: {database}")
+                    actual_database = database
+        else:
+            found_database = self.db_helper.find_correct_database_for_table(table_name, hostname)
+            if found_database:
+                actual_database = found_database
+            else:
+                print(f"❌ 未提供数据库名且无法找到表 {table_name} 所在的数据库")
                 return None
-                
-        except Exception as e:
-            print(f"❌ 获取表 {table_name} 行数时发生异常: {str(e)}")
+        
+        return self.db_helper.get_table_row_count(actual_database, table_name, hostname)
+
+    def _get_table_row_count_with_fallback(self, database: str, table_name: str, hostname: str = None, query: Optional[dict] = None) -> Optional[int]:
+        """获取表行数，若数据库查询失败则回退到查询元数据"""
+        row_count = self._get_table_row_count(database, table_name, hostname)
+        if row_count is None:
+            row_count = self._extract_row_count_from_query(query)
+        return row_count
+
+    def _extract_row_count_from_query(self, query: Optional[dict]) -> Optional[int]:
+        """从查询元数据中提取表行数"""
+        if not query or not isinstance(query, dict):
             return None
+        
+        direct_keys = [
+            'table_row_count', 'row_count', 'table_rows', 'rows',
+            'TABLE_ROWS', 'TABLE_ROW_COUNT', 'TABLE_ROWS_ESTIMATE',
+            'total_rows', 'row_num'
+        ]
+        
+        def parse_value(value):
+            if value is None:
+                return None
+            if isinstance(value, (int, float)):
+                return int(value)
+            if isinstance(value, str):
+                cleaned = value.replace(',', '').strip()
+                if not cleaned:
+                    return None
+                try:
+                    return int(float(cleaned))
+                except ValueError:
+                    return None
+            return None
+        
+        def try_extract(source):
+            if not source or not isinstance(source, dict):
+                return None
+            for key in direct_keys:
+                if key in source:
+                    parsed = parse_value(source[key])
+                    if parsed is not None:
+                        return parsed
+            return None
+        
+        def ensure_dict(value):
+            if isinstance(value, dict):
+                return value
+            if isinstance(value, str):
+                try:
+                    import json
+                    return json.loads(value)
+                except Exception:
+                    try:
+                        import ast
+                        return ast.literal_eval(value)
+                    except Exception:
+                        return {}
+            return {}
+        
+        # 顶层直接信息
+        direct = try_extract(query)
+        if direct is not None:
+            return direct
+        
+        # table_structure 中的信息
+        table_structure = ensure_dict(query.get('table_structure', {}))
+        if table_structure:
+            direct = try_extract(table_structure)
+            if direct is not None:
+                return direct
+            
+            for nested_key in ['table_stats', 'statistics', 'stats', 'meta']:
+                nested = ensure_dict(table_structure.get(nested_key, {}))
+                direct = try_extract(nested)
+                if direct is not None:
+                    return direct
+        
+        # 顶层其他统计字段
+        for nested_key in ['table_stats', 'statistics', 'meta']:
+            nested = ensure_dict(query.get(nested_key, {}))
+            direct = try_extract(nested)
+            if direct is not None:
+                return direct
+        
+        # 慢查询信息中的统计
+        slow_info = ensure_dict(query.get('slow_query_info', {}))
+        direct = try_extract(slow_info)
+        if direct is not None:
+            return direct
+        
+        for nested_key in ['table_stats', 'statistics', 'meta']:
+            nested = ensure_dict(slow_info.get(nested_key, {}))
+            direct = try_extract(nested)
+            if direct is not None:
+                return direct
+        
+        return None
 
     def _check_table_exists(self, database: str, table_name: str, hostname: str = None) -> bool:
-        """
-        检查表是否存在（安全版本）
-        """
-        if not database or not table_name:
-            return False
-        
-        # 使用安全查询执行
-        query_result = self._execute_safe_query(
-            "SELECT COUNT(*) as cnt FROM information_schema.tables WHERE table_schema = %s AND table_name = %s",
-            (database, table_name),
-            hostname,
-            database
-        )
-        
-        if query_result['status'] == 'success' and query_result['data']:
-            # 查询返回的是元组，第一个元素是计数
-            try:
-                count = int(query_result['data'][0][0]) if query_result['data'][0][0] is not None else 0
-                return count > 0
-            except (ValueError, TypeError, IndexError):
-                # 如果数据格式异常，返回False
-                return False
-        
-        # 如果查询失败，说明数据库连接有问题或表不存在，返回False
-        print(f"⚠️ 表存在性检查失败，数据库连接异常或表不存在，返回False")
-        return False
+        """检查表是否存在（包装方法）"""
+        return self.db_helper.check_table_exists(database, table_name, hostname)
     
-    def _get_table_indexes_from_db(self, database: str, table_name: str) -> Optional[set]:
-        """
-        从数据库中获取表的索引信息（安全版本）
-        
-        Returns:
-            Optional[set]: 索引字段集合，如果查询失败返回None
-        """
-        indexes = set()
-        
-        if not database or not table_name:
-            return indexes
-        
-        # 使用安全查询获取索引信息
-        query_result = self._execute_safe_query(
-            "SHOW INDEX FROM `{}`".format(table_name),
-            database=database
-        )
-        
-        # 区分查询失败和表没有索引的情况
-        if query_result['status'] == 'error':
-            # 查询失败，返回None表示不确定状态
-            print(f"❌ 数据库查询失败: {query_result.get('error', 'Unknown error')}")
-            return None
-        elif query_result['status'] == 'success':
-            if query_result['data']:
-                # 查询成功且有数据
-                for row in query_result['data']:
-                    # SHOW INDEX返回的是元组，需要按位置获取Column_name
-                    # MySQL SHOW INDEX的列顺序：Table, Non_unique, Key_name, Seq_in_index, Column_name, ...
-                    if len(row) >= 5:  # Column_name在第5个位置（索引4）
-                        column_name = row[4]  # Column_name字段
-                        if column_name:
-                            indexes.add(column_name.lower())
-                return indexes
-            else:
-                # 查询成功但没有数据（表确实没有索引）
-                print(f"ℹ️ 表 {table_name} 在数据库 {database} 中没有索引")
-                return set()  # 返回空集合表示确认没有索引
-        
-        # 其他情况返回None表示不确定
-        return None
+    def _get_table_indexes_from_db(self, database: str, table_name: str, hostname: str = None) -> Optional[set]:
+        """从数据库中获取表的索引信息（包装方法，支持hostname参数）"""
+        result = self.db_helper.get_table_indexes_from_db(database, table_name, hostname)
+        return result if result is not None else set()
     
     def _find_correct_database_for_table(self, table_name: str, hostname: Optional[str] = None) -> str:
         """
-        查找包含指定表的正确数据库（安全版本）
+        查找包含指定表的正确数据库（使用hostname_max连接真实业务数据库）
         
         Args:
             table_name: 表名
-            hostname: 主机名（可选），如果提供则使用该主机查找数据库
+            hostname: 主机名（可选），如果提供则使用该主机查找数据库（应该是hostname_max的值）
             
         Returns:
             包含该表的数据库名，如果未找到返回空字符串
         """
-        if not table_name:
-            return ""
-                
-        # 需要排除的数据库
-        excluded_dbs = ['information_schema', 'c2c_db', 'mysql', 'performance_schema', 'sys']
-        # 添加trans_00到trans_34到排除列表
-        for i in range(35):
-            excluded_dbs.append(f'trans_{i:02d}')
-                
-        # 使用安全查询获取所有数据库
-        query_result = self._execute_safe_query("SHOW DATABASES", hostname=hostname)
-        
-        if query_result['status'] != 'success' or not query_result['data']:
-            print(f"❌ 获取数据库列表失败: {query_result.get('message', '未知错误')}")
-            return ""
-        
-        # 获取所有数据库
-        all_dbs = [db[0] for db in query_result['data']]
-        
-        # 过滤掉排除的数据库
-        candidate_dbs = [db for db in all_dbs if db not in excluded_dbs]
-        
-        # 在每个候选数据库中查找表
-        for db in candidate_dbs:
-            # 使用安全查询检查表是否存在
-            check_result = self._execute_safe_query(
-                "SELECT COUNT(*) as cnt FROM information_schema.tables WHERE table_schema = %s AND table_name = %s",
-                (db, table_name),
-                hostname,
-                db
-            )
-            
-            # print(f"   查询结果状态: {check_result['status']}")
-            if check_result['status'] == 'success' and check_result['data']:
-                if check_result['data'][0][0] > 0:  # 元组的第一个元素是计数
-                    # print(f"✅ 找到表 '{table_name}' 在数据库 '{db}' 中!")
-                    return db
-            else:
-                print(f"   ❌ 在数据库 '{db}' 中未找到表 '{table_name}'")
-        
-        print(f"❌ 表 '{table_name}' 未在任何数据库中找到")
-        return ""
+        return self.db_helper.find_correct_database_for_table(table_name, hostname)
     
     def _check_indexes_exist(self, database: str, table_name: str, where_fields: list, join_fields: list, order_by_fields: list, query: Optional[dict] = None) -> bool:
         """
@@ -1304,7 +399,13 @@ class DatabaseOptimizationReport:
         if query and isinstance(query, dict) and 'table_structure' in query:
             print(f"ℹ️ 使用query参数中的表结构信息，跳过表存在性检查")
         elif database and table_name:
-            if not self._check_table_exists(database, table_name):
+            # 从query对象中获取hostname_max用于连接真实业务数据库
+            hostname_max = None
+            if query and isinstance(query, dict):
+                slow_info = query.get('slow_query_info', {})
+                hostname_max = slow_info.get('hostname_max') or slow_info.get('ip') or query.get('hostname_max') or query.get('ip')
+            
+            if not self._check_table_exists(database, table_name, hostname_max):
                 print(f"⚠️ 表 {table_name} 在数据库 {database} 中不存在，无法检查索引")
                 return False
         
@@ -1321,14 +422,30 @@ class DatabaseOptimizationReport:
         existing_indexed_fields = set()
         database_query_successful = False
         
-        # 1. 优先从数据库获取实际索引信息
+        # 1. 优先从数据库获取实际索引信息（使用hostname_max连接真实业务数据库）
+        # 从query对象或hostname参数中获取hostname_max
+        if not hostname_max:
+            if query and isinstance(query, dict):
+                slow_info = query.get('slow_query_info', {})
+                hostname_max = slow_info.get('hostname_max') or slow_info.get('ip') or query.get('hostname_max') or query.get('ip')
+        
         if database and table_name:
-            table_indexes = self._get_table_indexes_from_db(database, table_name)
-            if table_indexes is not None and table_indexes != set():
+            # 使用execute_safe_query直接查询索引信息（支持hostname参数）
+            query_result = self.db_helper.execute_safe_query(
+                f"SHOW INDEX FROM `{table_name}`",
+                hostname=hostname_max,
+                database=database
+            )
+            if query_result['status'] == 'success' and query_result['data']:
                 # 数据库查询成功且有数据
-                existing_indexed_fields.update(table_indexes)
-                database_query_successful = True
-                print(f"📊 从数据库读取到的索引字段: {existing_indexed_fields}")
+                for row in query_result['data']:
+                    if len(row) >= 5:
+                        column_name = row[4]
+                        if column_name:
+                            existing_indexed_fields.add(column_name.lower())
+                if existing_indexed_fields:
+                    database_query_successful = True
+                    print(f"📊 从数据库读取到的索引字段: {existing_indexed_fields}")
             # else:
             #     print(f"⚠️ 数据库查询失败或无索引数据，将从JSON数据中参考")
         
@@ -1425,303 +542,97 @@ class DatabaseOptimizationReport:
         return True
     
     def _mask_table_structure(self, table_structure) -> str:
-        """脱敏表结构信息，处理可能的非字符串输入"""
-        # 确保输入是字符串
-        if not isinstance(table_structure, str):
-            table_structure = str(table_structure)
-        
-        # 脱敏表名
-        masked_structure = re.sub(
-            r'(CREATE\s+TABLE\s+)([`\[\"]?\w+[`\]\"]?)',
-            lambda m: m.group(1) + self._mask_table_name(re.sub(r'[`\[\"]', '', m.group(2))),
-            table_structure, 
-            flags=re.IGNORECASE
-        )
-        
-        return masked_structure
+        """脱敏表结构信息（包装方法）"""
+        return DataMasking.mask_table_structure(table_structure)
     
     def _merge_analysis_results_to_compare_data(self, analysis_results: List[Dict]):
-        """将DeepSeek分析结果合并到compare_data结构中"""
-        try:
-            # 将分析结果按SQL内容映射到字典，便于快速查找
-            analysis_dict = {}
-            for result in analysis_results:
-                sql = result.get('sql', '')
-                if sql:
-                    analysis_dict[sql] = result
-            
-            # 合并到last_month的查询中
-            if self.compare_data and 'last_month' in self.compare_data and 'queries' in self.compare_data['last_month']:
-                merged_count = 0
-                for query in self.compare_data['last_month']['queries']:
-                    sql_content = query.get('sql_content', query.get('sql', ''))
-                    if sql_content in analysis_dict:
-                        analysis_result = analysis_dict[sql_content]
-                        # 添加DeepSeek分析结果
-                        query['deepseek_optimization'] = analysis_result.get('deepseek_optimization', '')
-                        query['optimization_suggestions'] = self._format_deepseek_suggestions(analysis_result.get('deepseek_optimization', ''), sql_content)
-                        query['table_structure'] = analysis_result.get('table_structure', {})
-                        query['explain_result'] = analysis_result.get('explain_result', {})
-                        query['analysis_time'] = analysis_result.get('analysis_time', '')
-                        print(f"合并分析结果到查询: {repr(sql_content[:50])}...")
-                        merged_count += 1
-                
-                # 如果没有找到匹配的查询，直接替换整个查询列表
-                if merged_count == 0:
-                    print("未找到匹配的查询，将替换整个查询列表")
-                    self.compare_data['last_month']['queries'] = self._convert_analysis_to_queries(analysis_results)
-            
-            # 合并到previous_month的查询中
-            if self.compare_data and 'previous_month' in self.compare_data and 'queries' in self.compare_data['previous_month']:
-                merged_count = 0
-                for query in self.compare_data['previous_month']['queries']:
-                    sql_content = query.get('sql_content', query.get('sql', ''))
-                    if sql_content in analysis_dict:
-                        analysis_result = analysis_dict[sql_content]
-                        # 添加DeepSeek分析结果
-                        query['deepseek_optimization'] = analysis_result.get('deepseek_optimization', '')
-                        query['optimization_suggestions'] = self._format_deepseek_suggestions(analysis_result.get('deepseek_optimization', ''), sql_content)
-                        query['table_structure'] = analysis_result.get('table_structure', {})
-                        query['explain_result'] = analysis_result.get('explain_result', {})
-                        query['analysis_time'] = analysis_result.get('analysis_time', '')
-                        print(f"合并分析结果到查询: {repr(sql_content[:50])}...")
-                        merged_count += 1
-                
-                # 如果没有找到匹配的查询，直接替换整个查询列表
-                if merged_count == 0:
-                    print("未找到匹配的查询，将替换整个查询列表")
-                    # 可以创建一个空的查询列表，或者使用部分分析结果
-                    self.compare_data['previous_month']['queries'] = []
-            
-            print(f"成功合并 {len(analysis_results)} 条DeepSeek分析结果到compare_data")
-            
-        except Exception as e:
-            print(f"合并分析结果失败: {e}")
+        """将DeepSeek分析结果合并到compare_data结构中（包装方法）"""
+        DataProcessor.merge_analysis_results_to_compare_data(
+            self.compare_data, 
+            analysis_results, 
+            DataProcessor.format_deepseek_suggestions
+        )
     
     def _create_compare_data_with_analysis(self, analysis_results: List[Dict]) -> Dict:
-        """创建包含DeepSeek分析结果的compare_data结构"""
-        try:
-            # 计算统计信息
-            total_count = len(analysis_results)
-            total_execute_cnt = 0
-            total_query_time = 0
-            
-            # 为每个分析结果创建查询结构
-            queries = []
-            for result in analysis_results:
-                query = {
-                    'sql': result.get('sql', ''),
-                    'sql_content': result.get('sql', ''),  # 兼容两种字段名
-                    'db_name': result.get('database', ''),
-                    'database': result.get('database', ''),  # 兼容两种字段名
-                    'table': result.get('table', ''),
-                    'deepseek_optimization': result.get('deepseek_optimization', ''),
-                    'optimization_suggestions': self._format_deepseek_suggestions(result.get('deepseek_optimization', ''), result.get('sql', '')),
-                    'table_structure': result.get('table_structure', {}),
-                    'explain_result': result.get('explain_result', {}),
-                    'analysis_time': result.get('analysis_time', ''),
-                    'slow_query_info': result.get('slow_query_info', {})
-                }
-                
-                # 提取执行次数和查询时间（如果可用）
-                if 'slow_query_info' in result:
-                    slow_info = result['slow_query_info']
-                    query['execute_cnt'] = slow_info.get('execute_cnt', 0)
-                    query['query_time'] = slow_info.get('query_time', 0)
-                    total_execute_cnt += int(query['execute_cnt'])
-                    total_query_time += float(query['query_time'])
-                
-                queries.append(query)
-            
-            avg_query_time = total_query_time / total_count if total_count > 0 else 0
-            
-            compare_data = {
-                'last_month': {
-                    'name': '当前分析周期',
-                    'total_count': total_count,
-                    'total_execute_cnt': total_execute_cnt,
-                    'avg_query_time': avg_query_time,
-                    'queries': queries
-                },
-                'previous_month': {
-                    'name': '上一周期',
-                    'total_count': 0,
-                    'total_execute_cnt': 0,
-                    'avg_query_time': 0,
-                    'queries': []
-                },
-                'comparison': {
-                    'count_change': 0,
-                    'execute_cnt_change': 0,
-                    'time_change': 0,
-                    'growth_rate': 0
-                }
-            }
-            
-            print(f"成功创建包含 {total_count} 条分析结果的compare_data结构")
-            return compare_data
-            
-        except Exception as e:
-            print(f"创建分析数据失败: {e}")
-            # 如果失败，返回一个空的结构
-            return {
-                'last_month': {'name': '当前分析周期', 'total_count': 0, 'total_execute_cnt': 0, 'avg_query_time': 0, 'queries': []},
-                'previous_month': {'name': '上一周期', 'total_count': 0, 'total_execute_cnt': 0, 'avg_query_time': 0, 'queries': []},
-                'comparison': {'count_change': 0, 'execute_cnt_change': 0, 'time_change': 0, 'growth_rate': 0}
-            }
+        """创建包含DeepSeek分析结果的compare_data结构（包装方法）"""
+        return DataProcessor.create_compare_data_with_analysis(
+            analysis_results, 
+            DataProcessor.format_deepseek_suggestions
+        )
     
     def _format_deepseek_suggestions(self, deepseek_optimization, sql_content: str = '') -> str:
-        """智能格式化DeepSeek优化建议，只给出最优的一条复合索引建议"""
-        if not deepseek_optimization:
-            return "暂无优化建议"
-        
-        # 获取原始建议
-        raw_suggestions = ''
-        if isinstance(deepseek_optimization, list):
-            raw_suggestions = '\n'.join(deepseek_optimization)
-        elif isinstance(deepseek_optimization, str):
-            raw_suggestions = deepseek_optimization
-        else:
-            raw_suggestions = str(deepseek_optimization)
-        
-        # 分析SQL内容，提取字段信息
-        if sql_content:
-            where_fields = self._extract_where_fields(sql_content)
-            join_fields = self._extract_join_fields(sql_content)
-            order_by_fields = self._extract_order_by_fields(sql_content)
-            
-            # 合并所有相关字段并按优先级排序
-            all_fields = set()
-            all_fields.update(where_fields)
-            all_fields.update(join_fields)
-            all_fields.update(order_by_fields)
-            
-            # 检查是否有函数字段
-            has_function_fields = any('(' in field and ')' in field for field in all_fields)
-            
-            # 如果有函数字段，提供MySQL 5.7兼容建议
-            if has_function_fields:
-                table_name = self._extract_table_name(sql_content)
-                if table_name:
-                    masked_table = self._mask_table_name(table_name)
-                    
-                    # 为函数字段提供专门的建议
-                    function_advice = "-- ⚠️ MySQL 5.7不支持函数索引，无法直接优化函数字段"
-                    alternative_advice = "-- 💡 建议修改查询避免使用函数，或升级到MySQL 8.0+"
-                    
-                    # 提取普通字段用于替代建议
-                    normal_fields = [field for field in all_fields if '(' not in field and ')' not in field]
-                    if normal_fields:
-                        if len(normal_fields) >= 2:
-                            # 如果有多个普通字段，推荐复合索引
-                            sorted_fields = self._sort_fields_by_priority(normal_fields, sql_content.lower())
-                            composite_fields = ', '.join(sorted_fields[:5])
-                            optimized_suggestion = f"{function_advice}\n{alternative_advice}\n-- 💡 替代方案：创建复合索引优化普通字段\nCREATE INDEX idx_composite ON {masked_table}({composite_fields});"
-                        else:
-                            # 单个普通字段
-                            field = normal_fields[0]
-                            optimized_suggestion = f"{function_advice}\n{alternative_advice}\n-- 💡 替代方案：创建单列索引优化字段 {field}\nCREATE INDEX idx_{masked_table.replace('*', '')}_{field} ON {masked_table}({field});"
-                    else:
-                        # 只有函数字段，无法提供有效索引建议
-                        optimized_suggestion = f"{function_advice}\n{alternative_advice}"
-                    
-                    return optimized_suggestion
-            
-            # 如果只有普通字段，优先推荐复合索引
-            if len(all_fields) >= 2:
-                # 智能排序字段，高频字段优先
-                sorted_fields = self._sort_fields_by_priority(list(all_fields), sql_content.lower())
-                
-                # 构建最优复合索引建议
-                if sorted_fields:
-                    composite_fields = ', '.join(sorted_fields[:5])  # 最多取前3个字段
-                    table_name = self._extract_table_name(sql_content)
-                    
-                    if table_name:
-                        # 对表名进行脱敏处理
-                        masked_table = self._mask_table_name(table_name)
-                        
-                        # 构建最优复合索引建议
-                        optimized_suggestion = f"-- 🔥【智能复合索引】多条件查询的核心优化\nCREATE INDEX idx_composite ON {masked_table}({composite_fields});"
-                        return optimized_suggestion
-        
-        # 如果只有一个字段或无法提取复合索引，返回原始建议中的第一条
-        suggestions_list = []
-        if isinstance(deepseek_optimization, list):
-            suggestions_list = deepseek_optimization
-        elif isinstance(deepseek_optimization, str):
-            # 按换行符分割字符串
-            suggestions_list = [s.strip() for s in deepseek_optimization.split('\n') if s.strip()]
-        
-        # 只返回第一条建议
-        if suggestions_list:
-            return suggestions_list[0]
-        
-        return raw_suggestions
+        """智能格式化DeepSeek优化建议（包装方法，保留复杂逻辑）"""
+        # 使用DataProcessor的方法，但保留主文件中的复杂逻辑
+        return DataProcessor.format_deepseek_suggestions(deepseek_optimization, sql_content)
     
     def _convert_analysis_to_queries(self, analysis_results: List[Dict]) -> List[Dict]:
-        """将分析结果转换为查询列表格式"""
-        queries = []
-        for result in analysis_results:
-            query = {
-                'sql': result.get('sql', ''),
-                'sql_content': result.get('sql', ''),
-                'db_name': result.get('database', ''),
-                'database': result.get('database', ''),
-                'table': result.get('table', ''),
-                'deepseek_optimization': result.get('deepseek_optimization', ''),
-                'optimization_suggestions': self._format_deepseek_suggestions(result.get('deepseek_optimization', ''), result.get('sql', '')),
-                'table_structure': result.get('table_structure', {}),
-                'explain_result': result.get('explain_result', {}),
-                'analysis_time': result.get('analysis_time', ''),
-                'slow_query_info': result.get('slow_query_info', {})
-            }
-            
-            # 提取执行次数和查询时间（如果可用）
-            if 'slow_query_info' in result:
-                slow_info = result['slow_query_info']
-                query['execute_cnt'] = slow_info.get('execute_cnt', 0)
-                query['query_time'] = slow_info.get('query_time', 0)
-            
-            queries.append(query)
-        
-        print(f"转换了 {len(queries)} 条分析结果为查询格式")
-        return queries
+        """将分析结果转换为查询列表格式（包装方法）"""
+        return DataProcessor.convert_analysis_to_queries(
+            analysis_results, 
+            self._format_deepseek_suggestions
+        )
     
     def create_report(self) -> str:
-        """创建Word格式的数据库优化分析报告"""
-        # 使用时间戳生成唯一文件名，避免权限冲突
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_file = f'数据库智能优化分析报告_{timestamp}.docx'
+        """创建Word格式的数据库优化分析报告（包装方法，调用新模块）"""
+        import os
+        from docx import Document
+        from datetime import datetime
         
-        self.document = Document()
+        # 创建输出目录
+        output_dir = "."
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
         
-        # 设置文档样式和页面布局
-        self._setup_document_styles()
-        self._setup_page_layout()
+        # 生成带时间戳的文件名
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"数据库智能优化分析报告_{timestamp}.docx"
+        filepath = os.path.join(output_dir, filename)
         
-        # 生成报告各个部分（移除目录，使文档更紧凑）
-        self._generate_report_header()
-        self._generate_report_summary()
+        # 创建Word文档
+        doc = Document()
         
-        # 如果有对比分析数据，添加对比分析部分
-        if hasattr(self, 'compare_data') and self.compare_data:
-            self._add_compare_analysis()
-            
-        self._generate_top_sql_statements()
-        self._generate_sql_details()
-        self._generate_summary_and_recommendations()
-        self._generate_report_footer()
+        # 创建报告生成核心实例
+        report_core = ReportGeneratorCore(
+            document=doc,
+            analysis_data=self.analysis_data,
+            compare_data=self.compare_data,
+            db_helper=self.db_helper,
+            sql_optimizer=self._analyze_sql_for_optimization
+        )
+        
+        # 设置页面布局和样式
+        report_core.setup_page_layout()
+        report_core.setup_document_styles()
+        
+        # 生成报告各部分
+        report_core.generate_report_header()
+        report_core.generate_report_summary()
+        report_core.add_compare_analysis()
+        report_core.generate_top_sql_statements()
+        report_core.generate_sql_details()
+        
+        # 生成总结和建议（使用 SummaryGenerator）
+        summary_gen = SummaryGenerator(
+            document=doc,
+            analysis_data=self.analysis_data,
+            compare_data=self.compare_data
+        )
+        summary_gen.generate_summary_and_recommendations()
+        
+        # 生成报告页脚
+        report_core.generate_report_footer()
         
         # 保存文档
-        self.document.save(output_file)
-        print(f"Word报告已生成: {output_file}")
-        return output_file
+        doc.save(filepath)
+        
+        print(f"Word报告已生成: {filepath}")
+        return filepath
         
     def _add_compare_analysis(self):
-        """添加上个月与上上个月的慢查询对比分析"""
-        # 直接在摘要下面添加分隔线
-        self._add_separator_line()
+        """添加上个月与上上个月的慢查询对比分析（包装方法，调用新模块）"""
+        # 这个方法已拆分到 ReportGeneratorCore，保留作为包装方法以保持向后兼容
+        # 实际调用会在 create_report 中通过 ReportGeneratorCore 实例进行
+        pass
         
         # 添加标题 - 左对齐并添加序列号
         title = self.document.add_heading('二、慢查询对比分析', level=1)
@@ -1861,283 +772,6 @@ class DatabaseOptimizationReport:
             error_para.add_run(f"生成对比分析时发生错误: {str(e)}").font.color.rgb = RGBColor(255, 0, 0)
             error_para.add_run("\n将继续生成报告的其他部分...")
     
-    def _extract_table_name_from_sql(self, sql: str) -> str:
-        """
-        从SQL语句中智能提取表名
-        
-        Args:
-            sql: SQL语句字符串
-            
-        Returns:
-            提取的表名，如果无法提取则返回'未知表'
-        """
-        if not sql:
-            return '未知表'
-        
-        # 清理SQL语句
-        sql_clean = sql.strip()
-        
-        # 支持多种SQL语句类型
-        
-        # 1. SELECT语句：提取FROM子句后的表名
-        if re.search(r'\bSELECT\b', sql_clean, re.IGNORECASE):
-            # 尝试从FROM子句中提取表名
-            from_match = re.search(r'FROM\s+`?(\w+)`?\b', sql_clean, re.IGNORECASE)
-            if from_match:
-                return from_match.group(1)
-            
-            # 尝试从JOIN子句中提取表名
-            join_match = re.search(r'JOIN\s+`?(\w+)`?\b', sql_clean, re.IGNORECASE)
-            if join_match:
-                return join_match.group(1)
-        
-        # 2. UPDATE语句：提取UPDATE后的表名
-        elif re.search(r'\bUPDATE\b', sql_clean, re.IGNORECASE):
-            update_match = re.search(r'UPDATE\s+`?(\w+)`?\b', sql_clean, re.IGNORECASE)
-            if update_match:
-                return update_match.group(1)
-        
-        # 3. INSERT语句：提取INSERT INTO后的表名
-        elif re.search(r'\bINSERT\b', sql_clean, re.IGNORECASE):
-            insert_match = re.search(r'INSERT\s+INTO\s+`?(\w+)`?\b', sql_clean, re.IGNORECASE)
-            if insert_match:
-                return insert_match.group(1)
-        
-        # 4. DELETE语句：提取DELETE FROM后的表名
-        elif re.search(r'\bDELETE\b', sql_clean, re.IGNORECASE):
-            delete_match = re.search(r'DELETE\s+FROM\s+`?(\w+)`?\b', sql_clean, re.IGNORECASE)
-            if delete_match:
-                return delete_match.group(1)
-        
-        # 5. 尝试从其他常见模式中提取表名
-        # 查找包含表名的模式：database.table或直接表名
-        table_patterns = [
-            r'FROM\s+`?(\w+)`?\b',
-            r'JOIN\s+`?(\w+)`?\b', 
-            r'UPDATE\s+`?(\w+)`?\b',
-            r'INSERT\s+INTO\s+`?(\w+)`?\b',
-            r'DELETE\s+FROM\s+`?(\w+)`?\b',
-            r'TABLE\s+`?(\w+)`?\b',
-            r'CREATE\s+TABLE\s+`?(\w+)`?\b',
-            r'ALTER\s+TABLE\s+`?(\w+)`?\b',
-            r'DROP\s+TABLE\s+`?(\w+)`?\b',
-            r'TRUNCATE\s+TABLE\s+`?(\w+)`?\b'
-        ]
-        
-        for pattern in table_patterns:
-            match = re.search(pattern, sql_clean, re.IGNORECASE)
-            if match:
-                return match.group(1)
-        
-        # 6. 最后尝试从SQL中提取第一个看起来像表名的单词
-        # 排除SQL关键字，只保留可能是表名的单词
-        sql_keywords = {
-            'select', 'from', 'where', 'and', 'or', 'insert', 'update', 'delete', 
-            'create', 'alter', 'drop', 'truncate', 'table', 'join', 'on', 'set',
-            'values', 'into', 'group', 'by', 'order', 'limit', 'having', 'like',
-            'in', 'is', 'null', 'not', 'between', 'exists', 'as', 'distinct',
-            'case', 'when', 'then', 'else', 'end', 'union', 'all', 'any', 'some'
-        }
-        
-        # 提取所有单词并过滤
-        words = re.findall(r'\b[a-zA-Z_]\w*\b', sql_clean)
-        for word in words:
-            word_lower = word.lower()
-            if word_lower not in sql_keywords and len(word) > 2:
-                # 简单的启发式规则：表名通常不是太短
-                return word
-        
-        return '未知表'
-    
-    def _extract_table_name_from_sql(self, sql: str) -> str:
-        """
-        从SQL语句中智能提取表名
-        
-        Args:
-            sql: SQL语句字符串
-            
-        Returns:
-            提取的表名，如果无法提取则返回'未知表'
-        """
-        if not sql:
-            return '未知表'
-        
-        # 清理SQL语句
-        sql_clean = sql.strip()
-        
-        # 支持多种SQL语句类型
-        
-        # 1. SELECT语句：提取FROM子句后的表名
-        if re.search(r'\bSELECT\b', sql_clean, re.IGNORECASE):
-            # 尝试从FROM子句中提取表名
-            from_match = re.search(r'FROM\s+`?(\w+)`?\b', sql_clean, re.IGNORECASE)
-            if from_match:
-                return from_match.group(1)
-            
-            # 尝试从JOIN子句中提取表名
-            join_match = re.search(r'JOIN\s+`?(\w+)`?\b', sql_clean, re.IGNORECASE)
-            if join_match:
-                return join_match.group(1)
-        
-        # 2. UPDATE语句：提取UPDATE后的表名
-        elif re.search(r'\bUPDATE\b', sql_clean, re.IGNORECASE):
-            update_match = re.search(r'UPDATE\s+`?(\w+)`?\b', sql_clean, re.IGNORECASE)
-            if update_match:
-                return update_match.group(1)
-        
-        # 3. INSERT语句：提取INSERT INTO后的表名
-        elif re.search(r'\bINSERT\b', sql_clean, re.IGNORECASE):
-            insert_match = re.search(r'INSERT\s+INTO\s+`?(\w+)`?\b', sql_clean, re.IGNORECASE)
-            if insert_match:
-                return insert_match.group(1)
-        
-        # 4. DELETE语句：提取DELETE FROM后的表名
-        elif re.search(r'\bDELETE\b', sql_clean, re.IGNORECASE):
-            delete_match = re.search(r'DELETE\s+FROM\s+`?(\w+)`?\b', sql_clean, re.IGNORECASE)
-            if delete_match:
-                return delete_match.group(1)
-        
-        # 5. 尝试从其他常见模式中提取表名
-        # 查找包含表名的模式：database.table或直接表名
-        table_patterns = [
-            r'FROM\s+`?(\w+)`?\b',
-            r'JOIN\s+`?(\w+)`?\b', 
-            r'UPDATE\s+`?(\w+)`?\b',
-            r'INSERT\s+INTO\s+`?(\w+)`?\b',
-            r'DELETE\s+FROM\s+`?(\w+)`?\b',
-            r'TABLE\s+`?(\w+)`?\b',
-            r'CREATE\s+TABLE\s+`?(\w+)`?\b',
-            r'ALTER\s+TABLE\s+`?(\w+)`?\b',
-            r'DROP\s+TABLE\s+`?(\w+)`?\b',
-            r'TRUNCATE\s+TABLE\s+`?(\w+)`?\b'
-        ]
-        
-        for pattern in table_patterns:
-            match = re.search(pattern, sql_clean, re.IGNORECASE)
-            if match:
-                return match.group(1)
-        
-        # 6. 最后尝试从SQL中提取第一个看起来像表名的单词
-        # 排除SQL关键字，只保留可能是表名的单词
-        sql_keywords = {
-            'select', 'from', 'where', 'and', 'or', 'insert', 'update', 'delete', 
-            'create', 'alter', 'drop', 'truncate', 'table', 'join', 'on', 'set',
-            'values', 'into', 'group', 'by', 'order', 'limit', 'having', 'like',
-            'in', 'is', 'null', 'not', 'between', 'exists', 'as', 'distinct',
-            'case', 'when', 'then', 'else', 'end', 'union', 'all', 'any', 'some'
-        }
-        
-        # 提取所有单词并过滤
-        words = re.findall(r'\b[a-zA-Z_]\w*\b', sql_clean)
-        for word in words:
-            word_lower = word.lower()
-            if word_lower not in sql_keywords and len(word) > 2:
-                # 简单的启发式规则：表名通常不是太短
-                return word
-        
-        return '未知表'
-    
-    def _find_actual_table_name(self, database: str, table_pattern: str) -> str:
-        """
-        在指定数据库中查找实际的表名
-        
-        Args:
-            database: 数据库名称
-            table_pattern: 表名模式（可以是部分表名）
-            
-        Returns:
-            实际的表名，如果未找到返回空字符串
-        """
-        if not database or not table_pattern:
-            return ""
-        
-        connection = None
-        try:
-            import pymysql
-            
-            # 获取数据库连接配置
-            db_config = getattr(self, 'slow_query_db_config', {}) if hasattr(self, 'slow_query_db_config') else {}
-            if not db_config:
-                return ""
-            
-            connection = pymysql.connect(
-                host=db_config.get('host', '127.0.0.1'),
-                port=db_config.get('port', 3306),
-                user=db_config.get('user', 'test'),
-                password=db_config.get('password', 'test'),
-                database=database,
-                charset='utf8mb4',
-                cursorclass=pymysql.cursors.DictCursor,
-                autocommit=True,
-                connect_timeout=5
-            )
-            
-            with connection.cursor() as cursor:
-                # 获取数据库中的所有表
-                cursor.execute("SHOW TABLES")
-                tables = [table[0] for table in cursor.fetchall()]
-                
-                # 优先查找完全匹配的表名
-                if table_pattern in tables:
-                    return table_pattern
-                
-                # 查找包含表名模式的所有表
-                matching_tables = [table for table in tables if table_pattern.lower() in table.lower()]
-                
-                if matching_tables:
-                    # 如果有多个匹配，优先选择名称更相似的表
-                    # 按表名长度和相似度排序
-                    def similarity_score(table):
-                        # 计算表名相似度得分
-                        score = 0
-                        if table.lower() == table_pattern.lower():
-                            score += 100
-                        if table.lower().startswith(table_pattern.lower()):
-                            score += 50
-                        if table.lower().endswith(table_pattern.lower()):
-                            score += 40
-                        # 长度越接近得分越高
-                        length_diff = abs(len(table) - len(table_pattern))
-                        score += max(0, 20 - length_diff)
-                        return score
-                    
-                    matching_tables.sort(key=similarity_score, reverse=True)
-                    return matching_tables[0]
-                
-                # 如果找不到匹配的表，尝试查找包含SQL常见表名模式
-                # 例如：SQL #7 可能对应表名是slow_query_7或类似模式
-                sql_tables = [
-                    f"slow_query_{table_pattern}",
-                    f"slow_query{table_pattern}",
-                    f"{table_pattern}_slow",
-                    f"{table_pattern}slow",
-                    f"query_{table_pattern}",
-                    f"query{table_pattern}",
-                    f"{table_pattern}_query",
-                    f"{table_pattern}query"
-                ]
-                
-                for candidate in sql_tables:
-                    if candidate in tables:
-                        return candidate
-                
-                # 最后尝试查找包含数字编号的表
-                for table in tables:
-                    # 检查表名是否包含数字模式
-                    if re.search(r'\d+', table) and (table_pattern in table.lower() or table_pattern.isdigit()):
-                        return table
-                
-        except Exception as e:
-            # 如果出现异常，返回空字符串
-            pass
-        finally:
-            try:
-                if connection:
-                    connection.close()
-            except:
-                pass
-        
-        return ""
     
     def _setup_page_layout(self):
         """设置页面布局"""
@@ -2444,8 +1078,11 @@ class DatabaseOptimizationReport:
             db_name = self._mask_db_name(db_name)
             
             # 如果数据库名是默认值或未知，尝试通过表名查找正确的数据库
+            # 使用hostname_max连接真实的业务数据库
             if db_name in ['未知', 'db', 't'] and table_name:
-                correct_db = self._find_correct_database_for_table(table_name)
+                # 获取hostname_max作为真实的业务数据库IP
+                hostname_max = slow_info.get('hostname_max') or slow_info.get('ip') or query.get('hostname_max') or query.get('ip')
+                correct_db = self._find_correct_database_for_table(table_name, hostname_max)
                 if correct_db:
                     db_name = correct_db
                     # 对找到的数据库名进行脱敏处理
@@ -2548,7 +1185,7 @@ class DatabaseOptimizationReport:
             # 需要在SQL脱敏之前提取表名，避免从脱敏后的SQL中提取到错误的表名
             table_name = query.get('table')
             if not table_name:
-                table_name = self._extract_table_name(sql_content)
+                table_name = SQLAnalyzer.extract_table_name(sql_content)
             
             # 对SQL内容进行脱敏处理
             sql_content = self._mask_sql(sql_content)
@@ -2607,8 +1244,11 @@ class DatabaseOptimizationReport:
             query_time = slow_info.get('query_time') or query.get('query_time', 0.0)
             
             # 如果数据库名是默认值或未知，尝试通过表名查找正确的数据库
+            # 使用hostname_max连接真实的业务数据库
             if db_name in ['未知', 'db', 't'] and table_name:
-                correct_db = self._find_correct_database_for_table(table_name)
+                # 获取hostname_max作为真实的业务数据库IP
+                hostname_max = slow_info.get('hostname_max') or slow_info.get('ip') or query.get('hostname_max') or query.get('ip')
+                correct_db = self._find_correct_database_for_table(table_name, hostname_max)
                 if correct_db:
                     db_name = correct_db
                     # 对找到的数据库名进行脱敏处理
@@ -2679,14 +1319,47 @@ class DatabaseOptimizationReport:
             sql_content: SQL语句内容
             database: 数据库名
             table: 表名
+            query: 查询对象，包含慢查询信息
+            hostname: 主机名
             
         Returns:
             包含具体可执行SQL语句的优化建议字符串
         """
         if not sql_content:
             return ""
+        
+        # 🎯 可选：优先使用新的智能优化建议生成器（默认关闭，保持拆分前逻辑）
+        if getattr(self, 'enable_intelligent_optimizer', False):
+            try:
+                if hasattr(self, 'intelligent_optimizer') and self.intelligent_optimizer:
+                    comprehensive_suggestions = self.intelligent_optimizer.generate_comprehensive_suggestions(
+                        sql_content=sql_content,
+                        database=database,
+                        table=table,
+                        query=query,
+                        hostname=hostname
+                    )
+                    
+                    if comprehensive_suggestions and comprehensive_suggestions.get('optimization_suggestions'):
+                        formatted_suggestions = self.intelligent_optimizer.format_suggestions_for_report(
+                            comprehensive_suggestions
+                        )
+                        if formatted_suggestions and formatted_suggestions != "暂无优化建议":
+                            return formatted_suggestions
+            except Exception:
+                # 如果智能优化建议生成器出错，继续使用原有逻辑
+                pass
             
         sql_lower = sql_content.lower()
+        table_alias_map = SQLAnalyzer.extract_table_aliases(sql_content)
+        primary_table_lower = (table_name or 'your_table_name').lower()
+        table_field_usage = defaultdict(lambda: {'where': [], 'join': []})
+        table_field_usage[table_name or 'your_table_name']  # ensure主表存在
+        
+        def resolve_table_alias(alias: Optional[str]) -> str:
+            if alias:
+                return table_alias_map.get(alias, alias)
+            return table_name or 'your_table_name'
         
         # 提取WHERE条件中的字段
         where_fields = []
@@ -2705,6 +1378,15 @@ class DatabaseOptimizationReport:
                 field_pattern = r'(\w+)\s*(?:=|>|<|>=|<=|!=|<>|like|in|is|between)'
                 where_fields = re.findall(field_pattern, where_clause, re.IGNORECASE)
                 
+                # 记录包含别名的字段，按表存储
+                alias_field_pattern = r'([a-zA-Z_]\w*)\s*\.\s*([a-zA-Z_]\w*)'
+                alias_matches = re.findall(alias_field_pattern, where_clause)
+                for alias_name, column_name in alias_matches:
+                    alias_clean = alias_name.strip('`')
+                    column_clean = column_name.strip('`')
+                    actual_table = resolve_table_alias(alias_clean)
+                    table_field_usage[actual_table]['where'].append(column_clean)
+                
                 # 提取函数字段（保持函数格式，如 LOWER(name)）
                 function_field_pattern = r'((?:lower|upper|substring|concat|length|trim|ltrim|rtrim|abs|ceil|floor|round|mod|rand|now|curdate|curtime|date|time|year|month|day)\s*\(\s*\w+\s*\))'
                 function_fields = re.findall(function_field_pattern, where_clause, re.IGNORECASE)
@@ -2722,14 +1404,35 @@ class DatabaseOptimizationReport:
                 words = re.findall(r'\b\w+\b', sql_lower)
                 sql_keywords = {'and', 'or', 'not', 'null', 'true', 'false', 'like', 'in', 'is', 'between', 'exists', 'where', 'select', 'from', 'join', 'on', 'group', 'order', 'by', 'limit', 'offset'}
                 where_fields = [word for word in words if word.isalpha() and word.lower() not in sql_keywords and len(word) > 2]
+            
+            # 无别名字段默认归属主表
+            for raw_field in where_fields:
+                if '.' not in raw_field and '(' not in raw_field:
+                    table_field_usage[table_name]['where'].append(raw_field)
         
         # 分析JOIN条件
-        if 'join' in sql_lower:
-            # 提取JOIN条件中的字段
-            join_pattern = r'on\s+([\w\.]+)\s*=\s*([\w\.]+)'
-            join_matches = re.findall(join_pattern, sql_lower, re.IGNORECASE)
-            for match in join_matches:
-                join_fields.extend([match[0].split('.')[-1], match[1].split('.')[-1]])
+        join_field_details = []
+        join_condition_pattern = r'([a-zA-Z_]\w*\.[a-zA-Z_]\w*)\s*=\s*([a-zA-Z_]\w*\.[a-zA-Z_]\w*)'
+        join_matches = re.findall(join_condition_pattern, sql_content, re.IGNORECASE)
+        for left_operand, right_operand in join_matches:
+            for operand in (left_operand, right_operand):
+                operand_clean = operand.strip()
+                if '.' in operand_clean:
+                    alias_part, column_part = operand_clean.split('.', 1)
+                else:
+                    alias_part, column_part = None, operand_clean
+                column_part = column_part.strip()
+                join_fields.append(column_part)
+                if alias_part:
+                    alias = alias_part.strip('`')
+                else:
+                    alias = None
+                actual_table = resolve_table_alias(alias)
+                join_field_details.append({
+                    'alias': alias,
+                    'table': actual_table or table_name,
+                    'column': column_part
+                })
         
         # 分析ORDER BY字段
         if 'order by' in sql_lower:
@@ -2763,6 +1466,8 @@ class DatabaseOptimizationReport:
         # 如果表名未知，使用安全占位符
         if not table_name:
             table_name = 'your_table_name'
+        primary_table_lower = (table_name or 'your_table_name').lower()
+        table_field_usage[table_name]
         
         # 🧠 AI智能判断是否最优状态 - 基于多维度分析
         # 判断标准：只有当查询确实无法进一步优化时才判断为最优
@@ -2791,19 +1496,29 @@ class DatabaseOptimizationReport:
                 is_optimal = False
         
         # 🎯 基于实际数据库检测的智能判断
+        # 从query对象或hostname参数中获取hostname_max，用于连接真实的业务数据库
+        if not hostname:
+            # 如果hostname参数未提供，从query对象中获取
+            if query and isinstance(query, dict):
+                slow_info = query.get('slow_query_info', {})
+                hostname = slow_info.get('hostname_max') or slow_info.get('ip') or query.get('hostname_max') or query.get('ip')
+        
+        hostname_max = hostname  # 使用hostname_max作为真实的业务数据库IP
+        
         # 检查表是否存在，如果database参数不是正确的数据库名，则查找正确的数据库
+        # 使用hostname_max连接真实的业务数据库
         correct_database = database
-        if database and table_name and not self._check_table_exists(database, table_name):
-            # 尝试查找包含该表的正确数据库
-            found_database = self._find_correct_database_for_table(table_name)
+        if database and table_name and not self._check_table_exists(database, table_name, hostname_max):
+            # 尝试查找包含该表的正确数据库（使用hostname_max）
+            found_database = self._find_correct_database_for_table(table_name, hostname_max)
             if found_database:
                 correct_database = found_database
                 # 更新表存在性检查，使用与表格生成相同的逻辑
-                table_exists = self._check_table_exists(correct_database, table_name)
+                table_exists = self._check_table_exists(correct_database, table_name, hostname_max)
             else:
                 table_exists = False
         else:
-            table_exists = self._check_table_exists(database, table_name)
+            table_exists = self._check_table_exists(database, table_name, hostname_max)
             
         if not table_exists:
             # 表不存在的情况，但我们有传入的query对象，可能包含表结构信息
@@ -2886,8 +1601,8 @@ class DatabaseOptimizationReport:
             if table_structure:
                 can_get_index_info = True
         
-        # 2. 检查是否能从数据库获取索引信息
-        if correct_database and table_name and self._check_table_exists(correct_database, table_name):
+        # 2. 检查是否能从数据库获取索引信息（使用hostname_max）
+        if correct_database and table_name and self._check_table_exists(correct_database, table_name, hostname_max):
             can_get_index_info = True
         
         # 🎯 关键修复：在判断"所有字段都有索引"之前，必须先检查是否有函数字段
@@ -2936,7 +1651,7 @@ class DatabaseOptimizationReport:
                 # 单字段查询且已有索引时，检查表行数
                 if where_fields and len(where_fields) == 1:
                     field_name = where_fields[0]
-                    table_row_count = self._get_table_row_count(database, table_name, hostname)
+                    table_row_count = self._get_table_row_count_with_fallback(database, table_name, hostname, query)
                     
                     if table_row_count is None:
                         # 无法获取表行数，提供基础优化建议
@@ -2948,36 +1663,11 @@ class DatabaseOptimizationReport:
                         optimization_parts.append("3. 监控慢查询日志，关注该查询的实际执行性能")
                         optimization_parts.append("4. 检查是否存在索引失效场景（如函数使用、类型转换、前导模糊查询等）")
                     elif table_row_count > 4000000:
-                        # 表行数超过400万，建议历史数据清理
-                        optimization_parts.append(f"🎯 智能诊断: 字段 {field_name} 已有索引，{table_name}表行数为{{:,}}，超过400万，建议进行历史数据清理".format(table_row_count))
-                        optimization_parts.append("")
-                        optimization_parts.append("💡 深度优化建议:")
-                        optimization_parts.append("1. 考虑按时间分区归档历史数据")
-                        optimization_parts.append("2. 定期清理超过保留期的数据") 
-                        optimization_parts.append("3. 考虑使用分区表优化大表性能")
+                        table_display = table_name.upper() if table_name else '目标表'
+                        row_count_str = "{:,}".format(table_row_count)
+                        return f"1. 智能诊断: 字段 {field_name} 已有索引，{table_display}表行数为{row_count_str}，超过400万，建议进行历史数据清理"
                     else:
-                        # 表行数正常，提供多维度优化建议
-                        optimization_parts.append(f"🎯 智能诊断: 字段 {field_name} 已有索引，{table_name}表行数为{{:,}}，在正常范围内".format(table_row_count))
-                        optimization_parts.append("")
-                        optimization_parts.append("💡 深度优化建议:")
-                        
-                        # SQL结构优化检查
-                        sql_lower = sql_content.lower()
-                        if 'select *' in sql_lower:
-                            optimization_parts.append("1. 避免SELECT *，只选择需要的字段以减少数据传输量")
-                        
-                        # 性能监控建议
-                        optimization_parts.append("2. 定期使用EXPLAIN分析查询执行计划，确认索引实际被使用")
-                        optimization_parts.append("3. 监控慢查询日志，关注该查询的实际执行时间")
-                        
-                        # 数据分布检查建议
-                        if table_row_count and table_row_count > 100000:
-                            row_count_str = "{:,}".format(table_row_count)
-                            optimization_parts.append(f"4. 表数据量较大({row_count_str}行)，关注索引选择性，确保字段值分布均匀")
-                        
-                        # 索引维护建议
-                        optimization_parts.append("5. 定期使用ANALYZE TABLE更新统计信息，确保优化器选择正确索引")
-                        optimization_parts.append("6. 检查是否存在索引失效场景（如函数使用、类型转换、前导模糊查询等）")
+                        return f"1. 智能诊断: 字段 {field_name} 已有索引，查询已处于最优状态"
                 else:
                     # 多字段情况，简单提示已有索引
                     optimization_parts.append("🎯 智能诊断: WHERE条件中的字段已有索引")
@@ -3045,11 +1735,22 @@ class DatabaseOptimizationReport:
                                 existing_indexed_fields.add(index_info['Column_name'].lower())
         
         # 2. 尝试从数据库中获取实际的索引信息（无论是否已有字段信息）
+        # 使用hostname_max连接真实的业务数据库
         if correct_database and table_name:
-            # 从实际数据库中获取索引信息，补充到已有信息中
-            db_indexes = self._get_table_indexes_from_db(correct_database, table_name)
-            if db_indexes is not None:
-                existing_indexed_fields.update(db_indexes)
+            # 从实际数据库中获取索引信息，补充到已有信息中（使用hostname_max）
+            # 注意：get_table_indexes_from_db需要支持hostname参数，但当前实现不支持
+            # 暂时使用execute_safe_query直接查询
+            query_result = self.db_helper.execute_safe_query(
+                f"SHOW INDEX FROM `{table_name}`",
+                hostname=hostname_max,
+                database=correct_database
+            )
+            if query_result['status'] == 'success' and query_result['data']:
+                for row in query_result['data']:
+                    if len(row) >= 5:
+                        column_name = row[4]
+                        if column_name:
+                            existing_indexed_fields.add(column_name.lower())
         
         # 3. 如果没有从数据库获取到，尝试从compare_data中获取
         if not existing_indexed_fields and hasattr(self, 'compare_data') and self.compare_data:
@@ -3143,11 +1844,16 @@ class DatabaseOptimizationReport:
             elif regular_fields_with_index and len(regular_fields_with_index) == 1:
                 # 单字段已有索引，检查表行数
                 field_name = regular_fields_with_index[0]
-                table_row_count = self._get_table_row_count(database, table_name, hostname)
+                table_row_count = self._get_table_row_count_with_fallback(database, table_name, hostname, query)
                 if table_row_count is not None and table_row_count > 4000000:
                     core_issues.append(f"字段 {field_name} 已有索引，但表行数达 {table_row_count:,}，建议历史数据清理")
-        if join_fields:
-            core_issues.append(f"JOIN条件中的字段 {', '.join(set(join_fields))} 可能需要索引支持")
+        if join_field_details:
+            join_descriptions = []
+            for table_key, usage in table_field_usage.items():
+                if usage['join']:
+                    join_descriptions.append(f"{table_key}.{', '.join(sorted(set(usage['join'])))}")
+            if join_descriptions:
+                core_issues.append(f"JOIN条件涉及字段需要索引支持：{'；'.join(join_descriptions)}")
         if order_by_fields and not where_fields:
             core_issues.append(f"ORDER BY排序操作可能导致性能问题")
         
@@ -3307,7 +2013,7 @@ class DatabaseOptimizationReport:
                     executable_actions.append(f"CREATE INDEX idx_{field_name} ON {table_name}({field_name});")
                 else:
                     # 字段已有索引，进行智能诊断：检查表行数
-                    table_row_count = self._get_table_row_count(database, table_name, hostname)
+                    table_row_count = self._get_table_row_count_with_fallback(database, table_name, hostname, query)
                     if table_row_count is None:
                         # 无法获取表行数信息，给出数据管理建议
                         solutions.append(f"字段 {field_name} 已有索引，建议定期清理历史数据以保持查询性能")
@@ -3352,49 +2058,51 @@ class DatabaseOptimizationReport:
         
         # 3. JOIN字段智能索引建议（只对没有函数使用的字段）
         # 注意：如果存在函数字段，JOIN字段索引建议仍然有效，因为JOIN字段不受函数索引限制
-        if join_fields and not function_used_fields:
-            for field in set(join_fields):
-                if field.lower() not in existing_indexed_fields:
-                    index_name = f"idx_{field}_join"
-                    solutions.append(f"为JOIN字段 {field} 创建单列索引优化连接性能")
-                    executable_actions.append(f"-- ✅ 为JOIN字段创建单列索引")
-                    executable_actions.append(f"CREATE INDEX {index_name} ON {table_name}({field});")
-                else:
-                    # JOIN字段已有索引，检查表行数
-                    table_row_count = self._get_table_row_count(database, table_name, hostname)
-                    if table_row_count is None:
-                        # 无法获取表行数信息
-                        solutions.append(f"⚠️ JOIN字段 {field} 已有索引，但无法获取表行数信息")
-                        executable_actions.append(f"-- ⚠️ 无法获取表行数信息")
-                        executable_actions.append(f"-- 建议：1. 检查information_schema访问权限")
-                        executable_actions.append(f"-- 建议：2. 确保表状态信息可用")
-                        executable_actions.append(f"-- 建议：3. 手动检查表数据量并评估JOIN性能")
-                    elif table_row_count > 4000000:
-                        solutions.append(f"⚠️ JOIN字段 {field} 已有索引，但表行数达 {table_row_count:,}，建议历史数据清理")
-                        executable_actions.append(f"-- ⚠️ 大表JOIN优化建议（行数: {table_row_count:,}）")
-                        executable_actions.append(f"-- 建议：1. 考虑按时间分区归档历史数据")
-                        executable_actions.append(f"-- 建议：2. 定期清理超过保留期的数据")
-                        executable_actions.append(f"-- 建议：3. 优化JOIN条件，减少参与连接的数据量")
-                    else:
-                        # JOIN字段已有索引且表行数正常，提供多维度的深度优化建议
-                        solutions.append(f"✅ JOIN字段 {field} 已有索引，当前表行数正常")
-                        
-                        # 添加JOIN优化的深度建议
-                        solutions.append("🔍 建议：确保JOIN字段类型一致，避免隐式类型转换导致索引失效")
-                        solutions.append("🔍 建议：考虑JOIN顺序优化，将小表放在前面，大表放在后面")
-                        solutions.append("🔍 建议：检查JOIN字段的选择性，确保关联字段值分布均匀")
-                        solutions.append("🔍 建议：对于频繁JOIN的字段组合，考虑创建复合索引")
-                if field not in where_fields:  # 避免重复
-                    # 检查该JOIN字段是否已有索引
-                    field_has_index = field.lower() in existing_indexed_fields
-                    if not field_has_index:
-                        index_name = f"idx_{field}_join"
-                        solutions.append(f"为JOIN字段 {field} 创建连接索引")
-                        executable_actions.append(f"-- 🔗 为JOIN操作创建连接索引")
-                        executable_actions.append(f"CREATE INDEX {index_name} ON {table_name}({field});")
-                    else:
-                        solutions.append(f"JOIN字段 {field} 已有索引，建议确认索引是否正常使用")
+        # 3. JOIN字段智能索引建议（只对没有函数使用的字段）
+        if join_field_details and not function_used_fields:
+            processed_join_fields = set()
+            for detail in join_field_details:
+                column = detail.get('column')
+                target_table = detail.get('table') or table_name
+                if not column or not target_table:
+                    continue
+                key = f"{target_table.lower()}.{column.lower()}"
+                if key in processed_join_fields:
+                    continue
+                processed_join_fields.add(key)
+                table_field_usage[target_table]['join'].append(column)
         
+        # 针对非主表的JOIN字段生成细化索引建议
+        if table_field_usage and not function_used_fields:
+            for table_key, usage in table_field_usage.items():
+                if not table_key:
+                    continue
+                if table_key.lower() == primary_table_lower:
+                    continue
+                combined_order = []
+                for col in usage['where']:
+                    if col and col not in combined_order:
+                        combined_order.append(col)
+                for col in usage['join']:
+                    if col and col not in combined_order:
+                        combined_order.append(col)
+                if not combined_order:
+                    continue
+                
+                if len(combined_order) >= 2:
+                    fields_subset = combined_order[:5]
+                    index_name = f"idx_{table_key.replace('.', '_')}_{'_'.join(fields_subset)}_join"
+                    fields_str = ', '.join(fields_subset)
+                    solutions.append(f"🔥 为表 {table_key} 创建复合索引覆盖JOIN字段：{fields_str}")
+                    executable_actions.append(f"-- 🔥【跨表JOIN复合索引】表 {table_key}")
+                    executable_actions.append(f"CREATE INDEX {index_name} ON {table_key}({fields_str});")
+                else:
+                    field = combined_order[0]
+                    index_name = f"idx_{table_key.replace('.', '_')}_{field}_join"
+                    solutions.append(f"为表 {table_key} 的 JOIN 字段 {field} 创建单列索引优化连接性能")
+                    executable_actions.append(f"-- ✅ 为表 {table_key} 的 JOIN字段 {field} 创建单列索引")
+                    executable_actions.append(f"CREATE INDEX {index_name} ON {table_key}({field});")
+
         # 4. 排序优化智能建议（只对没有函数使用的字段）
         # 注意：如果存在函数字段，排序字段索引建议仍然有效，因为排序不受函数索引限制
         if order_by_fields and len(order_by_fields) <= 3 and not function_used_fields:
@@ -3577,15 +2285,9 @@ class DatabaseOptimizationReport:
                 optimization_parts.append(f"CREATE INDEX {index_name} ON {table_name}({fields_str});")
                 optimization_parts.append(f"```")
             else:
-                # 单字段查询，已有索引，提供深度优化建议
-                optimization_parts.append(f"2. 智能优化建议：")
-                optimization_parts.append(f"✅ 当前WHERE条件涉及的字段已有索引，无需额外创建")
-                optimization_parts.append(f"")
-                optimization_parts.append(f"🔍 深度优化建议：")
-                optimization_parts.append(f"• 定期使用EXPLAIN确认索引实际被使用")
-                optimization_parts.append(f"• 监控查询执行时间，确保索引效果符合预期")
-                optimization_parts.append(f"• 检查是否存在索引失效场景（函数、类型转换等）")
-                optimization_parts.append(f"• 考虑查询返回字段数量，评估覆盖索引可能性")
+                # 单字段查询且已有索引，直接返回最优状态诊断
+                field_name = where_fields[0]
+                return f"1. 智能诊断: 字段 {field_name} 已有索引，查询已处于最优状态"
                 optimization_parts.append(f"• 关注数据分布变化，确保索引选择性保持良好")
         
         # 9. 预期效果 - 多维度智能优化效果预测
@@ -3735,20 +2437,26 @@ class DatabaseOptimizationReport:
                 if suggestions:
                     break
         
+        # 获取hostname_max用于连接真实的业务数据库
+        hostname_max = None
+        if isinstance(query, dict):
+            slow_info = query.get('slow_query_info', {})
+            hostname_max = slow_info.get('hostname_max') or slow_info.get('ip') or query.get('hostname_max') or query.get('ip')
+        
         # 如果deepseek_optimization是列表，转换为结构化字符串格式
         if isinstance(suggestions, list):
             # 直接调用智能分析函数生成具体的可执行SQL语句
             database = query.get('database', query.get('db_name', '')) if isinstance(query, dict) else ''
             # 确保传递原始表名信息
             original_table = query.get('table') if isinstance(query, dict) else None
-            suggestions = self._analyze_sql_for_optimization(sql_content, database, original_table or table_name, query)
+            suggestions = self._analyze_sql_for_optimization(sql_content, database, original_table or table_name, query, hostname_max)
         else:
             # 对于字符串格式的建议，如果内容不够具体，也调用智能分析
             if not suggestions or suggestions == '暂无优化建议' or '建议分析查询模式' in suggestions:
                 database = query.get('database', query.get('db_name', '')) if isinstance(query, dict) else ''
                 # 确保传递原始表名信息
                 original_table = query.get('table') if isinstance(query, dict) else None
-                suggestions = self._analyze_sql_for_optimization(sql_content, database, original_table or table_name, query)
+                suggestions = self._analyze_sql_for_optimization(sql_content, database, original_table or table_name, query, hostname_max)
         
         # 检查优化建议是否为空或无效
         if not suggestions or (isinstance(suggestions, str) and not suggestions.strip()) or suggestions == '暂无优化建议':
@@ -3756,7 +2464,7 @@ class DatabaseOptimizationReport:
             database = query.get('database', query.get('db_name', '')) if isinstance(query, dict) else ''
             # 确保传递原始表名信息
             original_table = query.get('table') if isinstance(query, dict) else None
-            suggestions = self._analyze_sql_for_optimization(sql_content, database, original_table or table_name, query)
+            suggestions = self._analyze_sql_for_optimization(sql_content, database, original_table or table_name, query, hostname_max)
         
         # 如果仍然没有有效建议，显示通用建议
         if not suggestions or (isinstance(suggestions, str) and not suggestions.strip()):
@@ -4332,7 +3040,11 @@ class DatabaseOptimizationReport:
                 if not table and sql_content:
                     table = self._extract_table_name(sql_content)
                 
-                suggestions = self._analyze_sql_for_optimization(sql_content, database, table)
+                # 获取hostname_max用于连接真实的业务数据库
+                slow_info = query.get('slow_query_info', {})
+                hostname_max = slow_info.get('hostname_max') or slow_info.get('ip') or query.get('hostname_max') or query.get('ip')
+                
+                suggestions = self._analyze_sql_for_optimization(sql_content, database, table, query, hostname_max)
             
             # 如果仍然没有有效建议，显示通用建议
             if not suggestions or (isinstance(suggestions, str) and not suggestions.strip()):
@@ -4503,474 +3215,13 @@ class DatabaseOptimizationReport:
             self._add_separator_line()
     
     def _generate_summary_and_recommendations(self):
-        """生成总结和建议"""
-        self.document.add_heading('五、总结与建议', level=1)
-        
-        # 总结
-        self.document.add_heading('（一）智能优化总结', level=2)
-        
-        # 基于实际分析数据生成智能发现
-        findings = []
-        
-        # 获取分析数据数量
-        try:
-            query_count = len(self.analysis_data) if self.analysis_data else 0
-        except (TypeError, AttributeError):
-            query_count = 0
-        
-        findings.append(f"发现 {query_count} 个需要优化的慢查询SQL")
-        
-        # 🎯 添加基于第四部分SQL详细分析的整体预期效果
-        if query_count > 0 and self.analysis_data:
-            # 收集所有SQL的预期效果进行整体总结
-            total_performance_improvement = 0
-            valid_effects_count = 0
-            optimization_details = []
-            
-            for query in self.analysis_data[:query_count]:  # 确保只处理实际显示的SQL数量
-                suggestions = query.get('deepseek_optimization', '') or query.get('optimization_suggestions', '')
-                if suggestions and suggestions != '暂无优化建议' and suggestions.strip():
-                    # 从第四部分提取预期效果
-                    lines = suggestions.split('')
-                    for line in lines:
-                        if '预期效果：' in line or '预期效果:' in line:
-                            # 提取性能提升信息
-                            if '提升' in line or '倍' in line or '降低' in line:
-                                optimization_details.append(line.strip())
-                                
-                                # 尝试提取具体的性能提升数字
-                                performance_match = re.search(r'(提升|降低|加快|改善).*?(\d+\.?\d*)\s*(倍|ms|秒|%|倍)', line)
-                                if performance_match:
-                                    try:
-                                        value = float(performance_match.group(2))
-                                        unit = performance_match.group(3)
-                                        
-                                        if unit in ['倍', '倍']:
-                                            total_performance_improvement += value
-                                            valid_effects_count += 1
-                                        elif unit == '%':
-                                            total_performance_improvement += value / 100  # 转换为倍数
-                                            valid_effects_count += 1
-                                        elif unit in ['ms', '秒']:
-                                            # 时间单位，简单估算提升效果
-                                            total_performance_improvement += 2.0  # 假设平均2倍提升
-                                            valid_effects_count += 1
-                                    except (ValueError, IndexError):
-                                        pass
-                            break
-            
-            # 生成整体预期效果总结
-            if valid_effects_count > 0:
-                avg_improvement = total_performance_improvement / valid_effects_count
-                # 限制在合理范围内
-                avg_improvement = max(1.5, min(10.0, avg_improvement))
-                
-                if avg_improvement >= 3.0:
-                    improvement_desc = f"预计整体查询性能提升{avg_improvement:.1f}倍，响应时间显著改善"
-                elif avg_improvement >= 2.0:
-                    improvement_desc = f"预计整体查询性能提升{avg_improvement:.1f}倍，响应时间明显改善" 
-                else:
-                    improvement_desc = f"预计整体查询性能提升{avg_improvement:.1f}倍，响应时间有所改善"
-                
-                findings.append(improvement_desc)
-                
-                # 添加优化类型统计
-                if len(optimization_details) > 0:
-                    findings.append(f"基于第四部分SQL详细分析，共生成{len(optimization_details)}条具体优化建议")
-            else:
-                findings.append("基于第四部分SQL详细分析，预计整体查询性能将得到有效改善")
-        
-        # 添加优化后的整体效果 - 只有在有实际优化建议时才显示
-        if query_count > 0:
-            # 收集所有SQL的预期效果进行整体总结
-            total_performance_improvement = 0
-            valid_effects_count = 0
-            optimization_details = []
-            
-            for query in self.analysis_data[:query_count]:  # 确保只处理实际显示的SQL数量
-                suggestions = query.get('deepseek_optimization', '') or query.get('optimization_suggestions', '')
-                if suggestions and suggestions != '暂无优化建议' and suggestions.strip():
-                    # 从第四部分提取预期效果
-                    lines = suggestions.split('')
-                    for line in lines:
-                        if '预期效果：' in line or '预期效果:' in line:
-                            # 提取性能提升信息
-                            if '提升' in line or '倍' in line or '降低' in line:
-                                optimization_details.append(line.strip())
-                            
-                            # 尝试提取具体的性能提升数字
-                            import re
-                            # 匹配如"提升5倍"、"降低80ms"、"60-90%"等
-                            performance_match = re.search(r'(提升|降低|加快|改善).*?(\d+\.?\d*)\s*(倍|ms|秒|%|倍)', line)
-                            if performance_match:
-                                try:
-                                    value = float(performance_match.group(2))
-                                    unit = performance_match.group(3)
-                                    
-                                    if unit in ['倍', '倍']:
-                                        total_performance_improvement += value
-                                        valid_effects_count += 1
-                                    elif unit == '%':
-                                        total_performance_improvement += value / 100  # 转换为倍数
-                                        valid_effects_count += 1
-                                    elif unit in ['ms', '秒']:
-                                        # 时间单位，简单估算提升效果
-                                        total_performance_improvement += 2.0  # 假设平均2倍提升
-                                        valid_effects_count += 1
-                                except (ValueError, IndexError):
-                                    pass
-                            break
-            
-        
-        # 添加优化后的整体效果 - 只有在有实际优化建议时才显示
-        if query_count > 0:
-            # 检查是否存在有效的智能优化建议
-            has_valid_optimization = False
-            valid_queries_with_optimization = 0
-            
-            # 统计各类问题的数量
-            index_optimization_count = 0
-            sql_structure_count = 0
-            high_impact_queries = 0
-            total_slow_queries_before = 0
-            total_slow_queries_after = 0
-            
-            try:
-                # 确保self.analysis_data不为None且可迭代
-                if self.analysis_data:
-                    for query in self.analysis_data if self.analysis_data else []:
-                        # 检查是否有有效的优化建议
-                        suggestions = query.get('deepseek_optimization', '') or query.get('optimization_suggestions', '')
-                        if suggestions and suggestions != '暂无优化建议' and suggestions.strip():
-                            has_valid_optimization = True
-                            
-                            # 获取查询时间信息
-                            slow_info = query.get('slow_query_info', {})
-                            query_time = slow_info.get('query_time_max') or slow_info.get('query_time') or query.get('query_time', 0)
-                            
-                            # 获取执行次数
-                            execute_cnt = slow_info.get('execute_cnt', 0)
-                            try:
-                                execute_cnt = int(execute_cnt)
-                                if execute_cnt > 100:
-                                    high_impact_queries += 1
-                            except (ValueError, TypeError):
-                                pass
-                            
-                            # 分类统计优化类型
-                            if '索引' in suggestions or 'index' in suggestions.lower():
-                                index_optimization_count += 1
-                            elif 'SQL' in suggestions or '结构' in suggestions:
-                                sql_structure_count += 1
-                            
-                            try:
-                                query_time = float(query_time)
-                                if query_time > 0:
-                                    valid_queries_with_optimization += 1
-                                    # 假设优化后查询时间降低到阈值以下（1秒）
-                                    if query_time > 1.0:
-                                        total_slow_queries_before += 1
-                                        # 根据优化类型预估优化后的查询时间
-                                        if '索引' in suggestions or 'index' in suggestions.lower():
-                                            optimized_time = query_time * 0.3  # 索引优化后30%原时间
-                                        elif 'SQL' in suggestions or '结构' in suggestions:
-                                            optimized_time = query_time * 0.6  # SQL结构优化后60%原时间
-                                        else:
-                                            optimized_time = query_time * 0.5  # 默认优化后50%原时间
-                                        
-                                        if optimized_time > 1.0:  # 如果优化后仍然超过1秒
-                                            total_slow_queries_after += 1
-                            except (ValueError, TypeError):
-                                continue
-            except (AttributeError, TypeError):
-                pass
-            
-            # 只有在有有效优化建议时才计算性能提升
-            if has_valid_optimization and valid_queries_with_optimization > 0:
-                # 计算真实的性能提升效果
-                total_improvement = 0
-                total_original_time = 0
-                total_optimized_time = 0
-                valid_queries = 0
-                
-                # 计算慢查询减少数量
-                slow_queries_reduced = max(0, total_slow_queries_before - total_slow_queries_after)
-                slow_queries_reduction_rate = 0
-                if total_slow_queries_before > 0:
-                    slow_queries_reduction_rate = (slow_queries_reduced / total_slow_queries_before) * 100
-                
-                try:
-                    # 确保self.analysis_data不为None且可迭代
-                    if self.analysis_data:
-                        for query in self.analysis_data if self.analysis_data else []:
-                            # 检查是否有有效的优化建议
-                            suggestions = query.get('deepseek_optimization', '') or query.get('optimization_suggestions', '')
-                            if suggestions and suggestions != '暂无优化建议' and suggestions.strip():
-                                # 获取查询时间信息
-                                slow_info = query.get('slow_query_info', {})
-                                # 优先使用query_time_max，其次是query_time
-                                query_time = slow_info.get('query_time_max') or slow_info.get('query_time') or query.get('query_time', 0)
-                                
-                                try:
-                                    query_time = float(query_time)
-                                    if query_time > 0:
-                                        # 基于实际优化建议计算性能提升（保守估计）
-                                        improvement_rate = 0.5  # 默认50%提升
-                                        if '索引' in suggestions or 'index' in suggestions.lower():
-                                            improvement_rate = 0.7  # 索引优化70%提升
-                                        elif 'SQL' in suggestions or '结构' in suggestions:
-                                            improvement_rate = 0.4  # SQL结构优化40%提升
-                                        
-                                        optimized_time = query_time * (1 - improvement_rate)
-                                        
-                                        total_original_time += query_time
-                                        total_optimized_time += optimized_time
-                                        valid_queries += 1
-                                except (ValueError, TypeError):
-                                    continue
-                        
-                        if valid_queries > 0:
-                            # 计算平均性能提升百分比
-                            avg_improvement = (1 - total_optimized_time / total_original_time) * 100
-                            # 限制在合理范围内
-                            avg_improvement = max(30, min(85, avg_improvement))
-                            
-                            # 计算平均查询时间
-                            avg_original_time_ms = (total_original_time / valid_queries) * 1000
-                            avg_optimized_time_ms = (total_optimized_time / valid_queries) * 1000
-                            
-                            # 添加详细的预期优化效果
-                            findings.append(f"优化后预计整体查询性能提升{avg_improvement:.0f}%，平均查询时间从{avg_original_time_ms:.0f}ms降低到{avg_optimized_time_ms:.0f}ms")
-                            
-                            # 添加执行次数总和统计
-                            if hasattr(self, 'compare_data') and self.compare_data:
-                                total_executions = self.compare_data.get('last_month', {}).get('total_execute_cnt', 0)
-                            if total_executions > 0:
-                                # Python 3.6兼容的千位分隔符格式化
-                                formatted_executions = "{:,}".format(total_executions)
-                                findings.append(f"性能问题SQL概览表格中执行次数总和：{formatted_executions}次")
-                                            
-                            # 添加慢查询减少效果
-                            if slow_queries_reduced > 0 and slow_queries_reduction_rate > 0:
-                                findings.append(f"预计慢查询数量减少{slow_queries_reduced}个，降低{slow_queries_reduction_rate:.0f}%")
-                            
-                            # 添加高频查询优化效果
-                            if high_impact_queries > 0:
-                                findings.append(f"优化{high_impact_queries}个高频执行查询，预计减少数据库负载30-50%")
-                            
-                            # 添加分类优化效果
-                            if index_optimization_count > 0:
-                                findings.append(f"通过索引优化解决{index_optimization_count}个查询问题，预计查询速度提升60-80%")
-                            if sql_structure_count > 0:
-                                findings.append(f"通过SQL结构优化改进{sql_structure_count}个查询，预计查询效率提升30-50%")
-                            
-                            # 添加总体业务价值
-                            total_optimization_count = index_optimization_count + sql_structure_count
-                            if total_optimization_count > 0:
-                                findings.append(f"综合优化{total_optimization_count}个核心查询，预计整体业务响应时间改善40-70%")
-                            
-                            # 计算系统整体性能提升
-                            if valid_queries > 0 and query_count > 0:
-                                # 基于优化查询比例计算整体系统提升
-                                optimization_ratio = valid_queries / query_count
-                                system_performance_boost = avg_improvement * optimization_ratio * 0.8  # 考虑实际实施效果
-                                
-                                # 数据库连接池优化效果
-                                db_connection_improvement = min(25, high_impact_queries * 2) if high_impact_queries > 0 else 15
-                                
-                                # CPU和内存使用优化
-                                resource_usage_reduction = max(20, min(40, avg_improvement * 0.5))
-                                
-                                findings.append(f"系统整体性能预计提升{system_performance_boost:.0f}%，数据库连接效率提升{db_connection_improvement}%")
-                                findings.append(f"服务器资源使用率预计降低{resource_usage_reduction:.0f}%，系统稳定性显著增强")
-                        else:
-                            findings.append("基于智能优化建议，预计整体查询性能可提升30-70%")
-                            findings.append("预计慢查询数量可减少20-40%，业务响应时间改善30-50%")
-                    else:
-                        findings.append("基于智能优化建议，预计整体查询性能可提升30-70%")
-                        findings.append("预计慢查询数量可减少20-40%，业务响应时间改善30-50%")
-                except (AttributeError, TypeError):
-                    findings.append("基于智能优化建议，预计整体查询性能可提升30-70%")
-                    findings.append("预计慢查询数量可减少20-40%，业务响应时间改善30-50%")
-        
-        # 分析问题类型
-        index_issues = 0
-        sql_structure_issues = 0
-        high_frequency_queries = 0
-        
-        try:
-            for query in self.analysis_data if self.analysis_data else []:
-                # 获取优化建议内容
-                suggestions = query.get('deepseek_optimization', '') or query.get('optimization_suggestions', '')
-                if suggestions:
-                    # 检查是否包含索引相关建议
-                    if '索引' in suggestions or 'index' in suggestions.lower():
-                        index_issues += 1
-                    # 检查是否包含SQL结构优化建议
-                    if 'SQL' in suggestions or '结构' in suggestions:
-                        sql_structure_issues += 1
-                    
-                    # 检查执行频率
-                    slow_info = query.get('slow_query_info', {})
-                    try:
-                        execute_cnt = int(slow_info.get('execute_cnt', 0))
-                        if execute_cnt > 1000:  # 高频查询阈值
-                            high_frequency_queries += 1
-                    except (ValueError, TypeError):
-                        continue
-        except (AttributeError, TypeError):
-            # 如果无法分析，使用默认值
-            index_issues = 2
-            sql_structure_issues = 1
-            high_frequency_queries = 3
-        
-        # 根据实际问题生成发现
-        if index_issues > 0:
-            findings.append(f"发现 {index_issues} 个查询存在索引相关问题")
-        
-        if high_frequency_queries > 0:
-            findings.append(f"识别出 {high_frequency_queries} 个高频执行的查询，对整体性能影响较大")
-        
-        if sql_structure_issues > 0:
-            findings.append(f"发现 {sql_structure_issues} 个查询存在SQL结构优化空间")
-        
-        # 创建发现列表，使用更好的格式
-        for finding in findings:
-            para = self.document.add_paragraph()
-            # 使用更醒目的项目符号
-            bullet_run = para.add_run('■ ')
-            bullet_run.font.name = '微软雅黑'
-            bullet_run.font.size = Pt(10.5)
-            bullet_run.font.color.rgb = RGBColor(192, 0, 0)
-            
-            # 内容
-            content_run = para.add_run(finding)
-            content_run.font.name = '宋体'
-            content_run.font.size = Pt(10.5)
-            para.paragraph_format.left_indent = Pt(5)
-        
-        # 添加空行
-        self.document.add_paragraph()
-        
-        # 优化建议
-        self.document.add_heading('（二）智能优化建议', level=2)
-        
-        # 基于实际分析数据生成智能优化建议
-        recommendations = []
-        
-        # 检查索引问题
-        index_issues = 0
-        sql_structure_issues = 0
-        high_frequency_queries = 0
-        
-        # 分析每个查询的问题类型
-        try:
-            for query in self.analysis_data if self.analysis_data else []:
-                # 获取优化建议内容
-                suggestions = query.get('deepseek_optimization', '') or query.get('optimization_suggestions', '')
-                if suggestions:
-                    # 检查是否包含索引相关建议
-                    if '索引' in suggestions or 'index' in suggestions.lower():
-                        index_issues += 1
-                    # 检查是否包含SQL结构优化建议
-                    if 'SQL' in suggestions or '结构' in suggestions:
-                        sql_structure_issues += 1
-                    
-                    # 检查执行频率
-                    slow_info = query.get('slow_query_info', {})
-                    try:
-                        execute_cnt = int(slow_info.get('execute_cnt', 0))
-                        if execute_cnt > 1000:  # 高频查询阈值
-                            high_frequency_queries += 1
-                    except (ValueError, TypeError):
-                        # 如果执行次数无法转换为整数，跳过该查询
-                        continue
-        except (AttributeError, TypeError):
-            # 如果analysis_data不可用或不是可迭代对象，使用默认值
-            index_issues = 2
-            sql_structure_issues = 1
-            high_frequency_queries = 3
-        
-        # 智能优化建议第一条 必须是加index，针对高频、全表扫描的必须加索引
-        # 强制第一条建议必须是索引相关的，无论是否检测到问题
-        if index_issues > 0:
-            recommendations.insert(0, f"1. 为存在索引问题的{index_issues}个查询添加适当的索引，特别是针对高频执行和全表扫描的查询必须创建索引")
-        elif high_frequency_queries > 0:
-            recommendations.insert(0, f"1. 针对{high_frequency_queries}个高频执行查询，必须检查索引使用情况，对全表扫描的查询必须创建索引")
-        else:
-            # 如果没有检测到任何问题，也强制显示索引建议
-            recommendations.insert(0, "建议对高频查询和全表扫描查询优先创建合适的索引")
-        
-        # 1. 索引优化策略（基于实际索引问题数量）
-        if index_issues > 0:
-            if index_issues <= 3:
-                recommendations.append(f"针对识别出的{index_issues}个索引相关查询，建议立即创建缺失的索引并优化复合索引结构")
-            elif index_issues <= 10:
-                recommendations.append(f"针对识别出的{index_issues}个索引相关查询，建议实施分批索引优化方案，优先处理高频查询")
-            else:
-                recommendations.append(f"针对识别出的{index_issues}个索引相关查询，建议建立索引生命周期管理机制，结合查询频率和业务重要性制定优化优先级")
-        
-        # 2. 高频查询优化策略（基于实际高频查询数量）
-        if high_frequency_queries > 0:
-            if high_frequency_queries <= 5:
-                recommendations.append(f"针对识别出的{high_frequency_queries}个高频查询，建议单独建立性能基线并实施实时监控，设置50%性能下降阈值告警")
-            else:
-                recommendations.append(f"针对识别出的{high_frequency_queries}个高频查询，建议实施分层优化策略：核心业务查询优化优先级最高，批量处理查询可适当放宽性能要求")
-        
-        # 3. SQL结构优化策略（基于实际结构问题数量）
-        if sql_structure_issues > 0:
-            if sql_structure_issues <= 3:
-                recommendations.append(f"针对识别出的{sql_structure_issues}个结构问题SQL，建议重构复杂子查询为连接查询，消除全表扫描操作")
-            else:
-                recommendations.append(f"针对识别出的{sql_structure_issues}个结构问题SQL，建议建立SQL审核规范，实施自动化SQL质量检查流程")
-        
-        # 4. 统计信息更新策略（基于索引和结构问题）
-        if index_issues > 0 or sql_structure_issues > 0:
-            recommendations.append("建立自适应统计信息更新机制：对高频变更表(日变更>10%)每日凌晨自动更新统计信息，中低频表每周日凌晨更新，确保优化器获得最新数据分布")
-        
-        # 5. 监控告警体系（基于高频查询数量）
-        if high_frequency_queries > 0:
-            recommendations.append("实施分级慢查询监控体系：建立P0/P1/P2三级分类，P0级(响应时间>1s)5分钟内告警并通知DBA，P1级(响应时间>500ms)30分钟内告警，P2级(响应时间>200ms)2小时内邮件通知")
-        
-        # 6. 性能基线管理
-        if query_count > 5:
-            recommendations.append("建立性能基线管理体系：为每个月关键查询建立历史性能基准，与上个月对比，预防性能退化")
-        
-        # 7. 索引生命周期管理（基于索引问题数量）
-        if index_issues > 5:
-            recommendations.append("实施索引生命周期管理：每月审查索引使用率，删除使用率低于1%的低效索引，合并功能重复的索引，降低存储和维护成本")
-        
-        # 确保至少有3条建议
-        if len(recommendations) < 3:
-            # 添加通用建议
-            recommendations.append("建立定期数据库健康检查机制：每月执行一次全面的性能评估")
-        
-        # 创建建议列表，使用更好的格式
-        for i, rec in enumerate(recommendations, 1):
-            para = self.document.add_paragraph()
-            # 使用编号
-            number_run = para.add_run(f"{i}. ")
-            number_run.font.name = '微软雅黑'
-            number_run.font.size = Pt(10.5)
-            number_run.font.bold = True
-            number_run.font.color.rgb = RGBColor(0, 0, 192)
-            
-            # 内容
-            content_run = para.add_run(rec)
-            content_run.font.name = '宋体'
-            content_run.font.size = Pt(10.5)
-            
-            # 设置段落格式
-            para.paragraph_format.left_indent = Pt(5)
-            
-            # 添加阴影效果
-            if i % 2 == 0:
-                shading_elm = OxmlElement("w:shd")
-                shading_elm.set(qn("w:fill"), "F5F5F5")
-                para._p.get_or_add_pPr().append(shading_elm)
-        
-        # 添加空行和分隔线
-        self._add_separator_line()
+        """生成总结和建议（包装方法，调用新模块）"""
+        summary_gen = SummaryGenerator(
+            document=self.document,
+            analysis_data=self.analysis_data,
+            compare_data=self.compare_data
+        )
+        summary_gen.generate_summary_and_recommendations()
     
     def _generate_report_footer(self):
         """生成报告页脚"""
@@ -5137,8 +3388,7 @@ def main():
             use_live_analysis=use_live_analysis,
             slow_query_db_config=slow_query_db_config,
             min_execute_cnt=min_execute_cnt,
-            min_query_time=min_query_time,
-            analysis_results_file="slow_query_analysis_20251114_102329.json"
+            min_query_time=min_query_time
         )
         
         # 检查是否成功获取了分析数据
