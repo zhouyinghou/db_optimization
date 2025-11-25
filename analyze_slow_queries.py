@@ -110,7 +110,7 @@ def find_database_for_table(connection, table_name: str) -> Optional[str]:
         original_connection_type = type(connection)
         
         # 使用不同的变量名避免与参数名冲突
-        with connection.cursor() as search_cursor:
+        with connection.cursor(pymysql.cursors.DictCursor) as search_cursor:
             # 验证连接对象在cursor创建后没有被修改
             if type(connection) != original_connection_type or id(connection) != original_connection_id:
                 logger.error(f"连接对象在cursor创建后被意外修改!")
@@ -379,6 +379,7 @@ class SlowQueryAnalyzer:
                         hostname_max
                         FROM {}
                         where ts_min >= %s AND ts_min <= %s
+                        AND sample NOT IN ('commit')
                         HAVING execute_cnt > %s and query_time > %s
                         ORDER BY execute_cnt, hostname_max
                         """.format(table_ref),

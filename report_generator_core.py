@@ -1035,16 +1035,26 @@ class ReportGeneratorCore:
         parts = []
         
         # 匹配1. 智能诊断（支持多种格式）
-        diagnosis_match = re.search(r'(1\.\s*智能诊断[:：]?[^\n]*\n[^\n]*|智能诊断[:：][^\n]*)', suggestions)
+        # 确保不匹配到 ```sql 代码块，在遇到```sql时停止
+        diagnosis_match = re.search(r'(1\.\s*智能诊断[:：]?.*?)(?=```sql|智能优化建议|预期效果|$)', suggestions, re.DOTALL)
         if diagnosis_match:
-            diagnosis_content = diagnosis_match.group(0)
+            diagnosis_content = diagnosis_match.group(1).strip()
+            # 移除可能包含的 ```sql 标记（双重保险）
+            diagnosis_content = re.sub(r'```sql.*?```', '', diagnosis_content, flags=re.DOTALL)
+            # 移除单独的 ```sql 标记
+            diagnosis_content = re.sub(r'```sql', '', diagnosis_content)
             if not diagnosis_content.startswith('1.'):
                 diagnosis_content = "1. " + diagnosis_content
-            parts.append(diagnosis_content)
+            parts.append(diagnosis_content.strip())
         else:
-            loose_diagnosis_match = re.search(r'(智能诊断[:：].*?)(?=智能优化建议|预期效果|$)', suggestions, re.DOTALL)
+            # 兜底匹配：匹配智能诊断到```sql或结束
+            loose_diagnosis_match = re.search(r'(智能诊断[:：].*?)(?=```sql|智能优化建议|预期效果|$)', suggestions, re.DOTALL)
             if loose_diagnosis_match:
                 diagnosis_content = loose_diagnosis_match.group(0).strip()
+                # 移除可能包含的 ```sql 标记
+                diagnosis_content = re.sub(r'```sql.*?```', '', diagnosis_content, flags=re.DOTALL)
+                # 移除单独的 ```sql 标记
+                diagnosis_content = re.sub(r'```sql', '', diagnosis_content)
                 if diagnosis_content.startswith('智能诊断：'):
                     diagnosis_content = diagnosis_content[5:]
                 elif diagnosis_content.startswith('智能诊断:'):
@@ -1052,15 +1062,30 @@ class ReportGeneratorCore:
                 diagnosis_content = "1. 智能诊断:\n" + diagnosis_content.strip()
                 parts.append(diagnosis_content)
         
-        # 匹配2. 智能优化建议（支持多种格式，包含完整的```sql代码块）
-        optimization_match = re.search(r'(2\.\s*智能优化建议.*?```sql.*?```)', suggestions, re.DOTALL)
+        # 匹配智能优化建议（支持多种格式，包含完整的```sql代码块）
+        # 优先匹配包含 SQL 代码块的部分（直接匹配```sql，或支持 "2. 智能优化建议：" 或 "智能优化建议：" 开头）
+        optimization_match = re.search(r'```sql.*?```', suggestions, re.DOTALL)
         if optimization_match:
-            parts.append(optimization_match.group(0))
+            # 直接提取 SQL 代码块，移除前面可能存在的 "2. 智能优化建议：" 或 "智能优化建议：" 标记
+            optimization_content = optimization_match.group(0)
+            # 检查前面是否有"智能优化建议"标记，如果有则移除
+            before_match = suggestions[:optimization_match.start()]
+            if re.search(r'(?:2\.\s*)?智能优化建议[:：]?\s*\n?$', before_match, re.MULTILINE):
+                # 前面有标记，但我们已经只提取了代码块，所以不需要额外处理
+                pass
+            # 直接使用 SQL 代码块作为标记，不添加额外的 "智能优化建议：" 文本
+            parts.append(optimization_content)
         else:
-            optimization_match = re.search(r'(2\.\s*智能优化建议[:：]?.*?)(?=\n\n[34]\.|预期效果|$)', suggestions, re.DOTALL)
+            # 匹配不包含 SQL 代码块的情况（可能包含 "2. 智能优化建议：" 或 "智能优化建议：" 标记）
+            optimization_match = re.search(r'((?:2\.\s*)?智能优化建议[:：]?.*?)(?=\n\n[34]\.|预期效果|$)', suggestions, re.DOTALL)
             if optimization_match:
-                parts.append(optimization_match.group(0))
+                # 移除 "2. 智能优化建议：" 标记
+                optimization_content = optimization_match.group(0)
+                optimization_content = re.sub(r'^(?:2\.\s*)?智能优化建议[:：]?\s*', '', optimization_content, flags=re.MULTILINE)
+                # 使用特殊标记，不包含 "智能优化建议：" 文本
+                parts.append("OPTIMIZATION_PART:" + optimization_content)
             else:
+                # 兜底匹配：匹配任何以"智能优化建议"开头的内容
                 loose_optimization_match = re.search(r'(智能优化建议[:：].*?)(?=预期效果|$)', suggestions, re.DOTALL)
                 if loose_optimization_match:
                     optimization_content = loose_optimization_match.group(0).strip()
@@ -1068,8 +1093,8 @@ class ReportGeneratorCore:
                         optimization_content = optimization_content[6:]
                     elif optimization_content.startswith('智能优化建议:'):
                         optimization_content = optimization_content[5:]
-                    optimization_content = "2. 智能优化建议:\n" + optimization_content.strip()
-                    parts.append(optimization_content)
+                    # 使用特殊标记，不包含 "智能优化建议：" 文本
+                    parts.append("OPTIMIZATION_PART:" + optimization_content.strip())
         
         # 匹配3/4. 预期效果（支持多种格式）
         effect_match = re.search(r'([34]\.\s*[^\n]*预期效果[^\n]*[:：]?.*?)(?=\n\n[45]\.|$)', suggestions, re.DOTALL)
@@ -1095,7 +1120,8 @@ class ReportGeneratorCore:
         for part in parts:
             if '智能诊断' in part and ('1.' in part or part.startswith('**1.') or part.startswith('智能诊断')):
                 diagnosis_part = part
-            elif '智能优化建议' in part and ('2.' in part or part.startswith('**2.') or part.startswith('智能优化建议')):
+            elif '智能优化建议' in part or '```sql' in part or part.startswith('OPTIMIZATION_PART:'):
+                # 识别为优化建议部分（包含 SQL 代码块或特殊标记）
                 optimization_part = part
             elif '预期效果' in part:
                 effect_part = part
@@ -1105,7 +1131,14 @@ class ReportGeneratorCore:
         if diagnosis_part:
             reordered_parts.append(diagnosis_part)
         if optimization_part:
-            reordered_parts.append(optimization_part)
+            # 在添加到重新排序列表之前，再次确保移除 "2. 智能优化建议：" 标记
+            optimization_part_clean = re.sub(r'^2\.\s*智能优化建议[:：]?\s*\n?', '', optimization_part, flags=re.MULTILINE)
+            optimization_part_clean = re.sub(r'2\.\s*智能优化建议[:：]?\s*\n?', '', optimization_part_clean, flags=re.MULTILINE)
+            # 如果清理后内容不为空，使用清理后的版本；否则使用原始版本
+            if optimization_part_clean.strip() and optimization_part_clean != optimization_part:
+                reordered_parts.append(optimization_part_clean)
+            else:
+                reordered_parts.append(optimization_part)
         if effect_part:
             reordered_parts.append(effect_part)
         
@@ -1131,58 +1164,75 @@ class ReportGeneratorCore:
                 issue_content_run.font.color.rgb = RGBColor(192, 0, 0)
                 issue_content.paragraph_format.left_indent = Pt(15)
             
-            elif part.startswith('2. 智能优化建议') or part.startswith('**2. 智能优化建议**') or '智能优化建议' in part:
-                if not (part.strip().startswith('智能优化建议：') or part.strip().startswith('智能优化建议:')):
-                    solution_title = self.document.add_paragraph()
-                    solution_title.paragraph_format.space_before = Pt(0)
-                    solution_title_run = solution_title.add_run('💡 智能优化建议:')
-                    solution_title_run.bold = True
-                    solution_title_run.font.name = '微软雅黑'
-                    solution_title_run.font.size = Pt(11)
-                    solution_title_run.font.color.rgb = RGBColor(0, 128, 0)
+            elif part.startswith('2. 智能优化建议') or part.startswith('**2. 智能优化建议**') or '智能优化建议' in part or '```sql' in part or part.startswith('OPTIMIZATION_PART:'):
+                # 处理特殊标记
+                if part.startswith('OPTIMIZATION_PART:'):
+                    part = part.replace('OPTIMIZATION_PART:', '', 1)
+                
+                # 在渲染前，立即移除所有 "2. 智能优化建议：" 和 "智能优化建议：" 标记
+                part = re.sub(r'^2\.\s*智能优化建议[:：]?\s*\n?', '', part, flags=re.MULTILINE)
+                part = re.sub(r'2\.\s*智能优化建议[:：]?\s*\n?', '', part, flags=re.MULTILINE)
+                part = re.sub(r'^智能优化建议[:：]?\s*\n?', '', part, flags=re.MULTILINE)
+                # 移除开头的空白行
+                part = part.lstrip('\n')
+                
+                # 总是添加 "💡 智能优化建议:" 标题
+                solution_title = self.document.add_paragraph()
+                solution_title.paragraph_format.space_before = Pt(0)
+                solution_title_run = solution_title.add_run('💡 智能优化建议:')
+                solution_title_run.bold = True
+                solution_title_run.font.name = '微软雅黑'
+                solution_title_run.font.size = Pt(11)
+                solution_title_run.font.color.rgb = RGBColor(0, 128, 0)
                 
                 if '```sql' in part:
-                    sql_parts = part.split('```sql')
-                    for sql_code_part in sql_parts[1:]:
-                        if '```' in sql_code_part:
-                            sql_code = sql_code_part.split('```')[0].strip()
-                            if sql_code:
-                                sql_lines = sql_code.split('\n')
-                                for sql_line in sql_lines:
-                                    if sql_line.strip():
-                                        line_para = self.document.add_paragraph()
-                                        line_run = line_para.add_run(sql_line)
-                                        line_run.font.name = 'Consolas'
-                                        line_run.font.size = Pt(9)
-                                        
-                                        if sql_line.strip().startswith('-- 🔥'):
-                                            line_run.font.color.rgb = RGBColor(255, 0, 0)
-                                            line_run.font.bold = True
-                                        elif sql_line.strip().startswith('-- 🔍') or sql_line.strip().startswith('-- ✅'):
-                                            line_run.font.color.rgb = RGBColor(0, 100, 200)
-                                            line_run.font.bold = True
-                                        elif sql_line.strip().startswith('-- 智能优化建议:'):
-                                            line_run.font.color.rgb = RGBColor(0, 128, 0)
-                                            line_run.font.bold = True
-                                        elif sql_line.strip().startswith('--'):
-                                            line_run.font.color.rgb = RGBColor(128, 128, 128)
-                                        elif 'CREATE INDEX' in sql_line.upper() or 'ALTER TABLE' in sql_line.upper():
-                                            line_run.font.color.rgb = RGBColor(0, 128, 0)
-                                            line_run.font.bold = True
-                                        elif 'EXPLAIN' in sql_line.upper() or 'SHOW' in sql_line.upper() or 'ANALYZE' in sql_line.upper():
-                                            line_run.font.color.rgb = RGBColor(0, 100, 200)
-                                        else:
-                                            line_run.font.color.rgb = RGBColor(0, 0, 0)
-                                        
-                                        line_para.paragraph_format.left_indent = Pt(20)
-                                        line_para.paragraph_format.space_before = Pt(0)
-                                        line_para.paragraph_format.space_after = Pt(0)
+                    # 移除所有 ```sql 和 ``` 标记，只保留SQL代码内容
+                    # 先移除开头的 ```sql
+                    part = re.sub(r'^```sql\s*\n?', '', part, flags=re.MULTILINE)
+                    # 移除结尾的 ```
+                    part = re.sub(r'\n?```\s*$', '', part, flags=re.MULTILINE)
+                    # 移除中间的 ```sql 和 ``` 标记（如果有多个代码块）
+                    part = re.sub(r'```sql\s*\n?', '', part, flags=re.MULTILINE)
+                    part = re.sub(r'\n?```\s*', '', part, flags=re.MULTILINE)
+                    
+                    # 现在 part 只包含纯SQL代码，直接处理
+                    if part.strip():
+                        sql_lines = part.strip().split('\n')
+                        for sql_line in sql_lines:
+                            if sql_line.strip():
+                                line_para = self.document.add_paragraph()
+                                line_run = line_para.add_run(sql_line)
+                                line_run.font.name = 'Consolas'
+                                line_run.font.size = Pt(9)
+                                
+                                if sql_line.strip().startswith('-- 🔥'):
+                                    line_run.font.color.rgb = RGBColor(255, 0, 0)
+                                    line_run.font.bold = True
+                                elif sql_line.strip().startswith('-- 🔍') or sql_line.strip().startswith('-- ✅'):
+                                    line_run.font.color.rgb = RGBColor(0, 100, 200)
+                                    line_run.font.bold = True
+                                elif sql_line.strip().startswith('-- 智能优化建议:'):
+                                    line_run.font.color.rgb = RGBColor(0, 128, 0)
+                                    line_run.font.bold = True
+                                elif sql_line.strip().startswith('--'):
+                                    line_run.font.color.rgb = RGBColor(128, 128, 128)
+                                elif 'CREATE INDEX' in sql_line.upper() or 'ALTER TABLE' in sql_line.upper():
+                                    line_run.font.color.rgb = RGBColor(0, 128, 0)
+                                    line_run.font.bold = True
+                                elif 'EXPLAIN' in sql_line.upper() or 'SHOW' in sql_line.upper() or 'ANALYZE' in sql_line.upper():
+                                    line_run.font.color.rgb = RGBColor(0, 100, 200)
+                                else:
+                                    line_run.font.color.rgb = RGBColor(0, 0, 0)
+                                
+                                line_para.paragraph_format.left_indent = Pt(20)
+                                line_para.paragraph_format.space_before = Pt(0)
+                                line_para.paragraph_format.space_after = Pt(0)
                 else:
-                    content = re.sub(r'^2\.\s*智能优化建议[:：]?\s*|^\*\*2\.\s*智能优化建议\*\*\s*|^智能优化建议[:：]?\s*', '', part)
-                    if content.strip():
+                    # part 已经在上面清理过了，直接使用
+                    if part.strip():
                         solution_content = self.document.add_paragraph()
                         solution_content.paragraph_format.space_before = Pt(0)
-                        solution_content_run = solution_content.add_run(content)
+                        solution_content_run = solution_content.add_run(part)
                         solution_content_run.font.name = '宋体'
                         solution_content_run.font.size = Pt(10.5)
                         solution_content.paragraph_format.left_indent = Pt(15)
@@ -1251,14 +1301,4 @@ class ReportGeneratorCore:
             "3. 预期效果: 预计平均查询时间可降低50%以上"
         ]
         return "\n".join(fallback)
-    
-    def check_indexes_exist(self, database: str, table_name: str, where_fields: list, join_fields: list, order_by_fields: list, query: Optional[dict] = None) -> bool:
-        """检查所有相关字段是否都有索引（占位方法）"""
-        # TODO: 从主文件复制完整实现
-        return False
-    
-    def check_composite_index_exists(self, existing_indexed_fields: set, composite_fields: list) -> bool:
-        """检查是否已有复合索引覆盖指定的字段组合（占位方法）"""
-        # TODO: 从主文件复制完整实现
-        return False
     
